@@ -322,19 +322,33 @@ index 0000000..433acc4
 +	}
 +}
 diff --git a/internal/aistudio/generate.go b/internal/aistudio/generate.go
-index 66fd1d2..4be44df 100644
+index 66fd1d2..6f390ca 100644
 --- a/internal/aistudio/generate.go
 +++ b/internal/aistudio/generate.go
-@@ -664,6 +664,9 @@ func validateGenerateEntry(request GenerateRequest, entry modelEntry) error {
+@@ -664,6 +664,13 @@ func validateGenerateEntry(request GenerateRequest, entry modelEntry) error {
  }
  
  func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
 +	if err := VerifyMixerLease(ctx); err != nil {
 +		return nil, err
 +	}
++	if MixerChannelFromContext(ctx) != "" {
++		// A retry must not retain validation headers from a previous account.
++		reportMixerThinkingValidation(ctx, "")
++	}
  	lease, leased := AccountLeaseFromContext(ctx)
  	build := leased && lease.Channel() == ChannelBuild
  	var entry modelEntry
+@@ -676,6 +683,9 @@ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	if err := ValidateMixerThinking(ctx, request.Config, entry.defaults); err != nil {
++		return nil, err
++	}
+ 	request.Tools, err = supportedTools(request.Tools, entry.model)
+ 	if err != nil {
+ 		return nil, fmt.Errorf("%w: %v", ErrInvalidArgument, err)
 diff --git a/internal/aistudio/mixer_channel.go b/internal/aistudio/mixer_channel.go
 new file mode 100644
 index 0000000..db2aac4
@@ -479,6 +493,232 @@ index 0000000..5521d79
 +		t.Fatal("disabled Build silently switched source")
 +	}
 +}
+diff --git a/internal/aistudio/mixer_thinking.go b/internal/aistudio/mixer_thinking.go
+new file mode 100644
+index 0000000..22befcb
+--- /dev/null
++++ b/internal/aistudio/mixer_thinking.go
+@@ -0,0 +1,53 @@
++package aistudio
++
++import (
++	"context"
++	"fmt"
++	"slices"
++	"strings"
++)
++
++var catalogThinkingLevelNames = map[int64]string{1: "low", 2: "medium", 3: "high", 4: "minimal"}
++
++type mixerThinkingObserverKey struct{}
++
++// ContextWithMixerThinkingObserver reports only validation against the selected
++// account's catalog. It is not an acknowledgment from Google of execution effort.
++func ContextWithMixerThinkingObserver(ctx context.Context, observer func(string)) context.Context {
++	return context.WithValue(ctx, mixerThinkingObserverKey{}, observer)
++}
++
++func reportMixerThinkingValidation(ctx context.Context, level string) {
++	if observer, ok := ctx.Value(mixerThinkingObserverKey{}).(func(string)); ok && observer != nil {
++		observer(level)
++	}
++}
++
++// ValidateMixerThinking prevents the upstream compatibility layer from silently
++// dropping or rounding an explicit level for source-locked Mixer requests.
++// The caller must provide the actual leased account's freshly selected defaults.
++func ValidateMixerThinking(ctx context.Context, config GenerationConfig, defaults GenerationDefaults) error {
++	if MixerChannelFromContext(ctx) == "" {
++		return nil
++	}
++	reportMixerThinkingValidation(ctx, "")
++	effort := strings.ToLower(strings.TrimSpace(config.ReasoningEffort))
++	if effort == "" || effort == "thinking_level_unspecified" {
++		return nil
++	}
++	var requested int64
++	for level, name := range catalogThinkingLevelNames {
++		if effort == name {
++			requested = level
++			break
++		}
++	}
++	if requested == 0 || !defaults.ThinkingLevel || !slices.Contains(defaults.ThinkingLevels, requested) {
++		return fmt.Errorf("%w: thinking level is not explicitly supported by the selected account model catalog", ErrInvalidArgument)
++	}
++	if config.ThinkingBudget != nil {
++		return fmt.Errorf("%w: a locked thinking level cannot be combined with a thinking budget", ErrInvalidArgument)
++	}
++	reportMixerThinkingValidation(ctx, strings.ToUpper(effort))
++	return nil
++}
+diff --git a/internal/aistudio/mixer_thinking_test.go b/internal/aistudio/mixer_thinking_test.go
+new file mode 100644
+index 0000000..ebbdcd2
+--- /dev/null
++++ b/internal/aistudio/mixer_thinking_test.go
+@@ -0,0 +1,136 @@
++package aistudio
++
++import (
++	"bytes"
++	"context"
++	"encoding/json"
++	"errors"
++	"reflect"
++	"testing"
++)
++
++func TestMixerCatalogPublishesOnlyObservedThinkingLevels(t *testing.T) {
++	for _, test := range []struct {
++		name   string
++		codes  []int64
++		levels []int64
++		want   []string
++	}{
++		{"exact", []int64{1, 25, 52}, []int64{1, 3, 99}, []string{"low", "high"}},
++		{"not inferred", []int64{1, 25, 52}, nil, nil},
++		{"capability required", []int64{1, 25}, []int64{1, 2, 3}, nil},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			row := make([]any, 83)
++			row[0], row[3], row[6], row[7], row[64] = "models/fixture", "Fixture", int64(1024), []string{"generateContent"}, test.codes
++			row[71] = []any{nil, nil, nil, nil, nil, int64(2), test.levels}
++			raw, err := json.Marshal([]any{[]any{row}})
++			if err != nil {
++				t.Fatal(err)
++			}
++			models, err := ParseModels(bytes.NewReader(raw))
++			if err != nil {
++				t.Fatal(err)
++			}
++			if got := models[0].CapabilityOptions["thinking_levels"]; !reflect.DeepEqual(got, test.want) {
++				t.Fatalf("thinking levels=%v want=%v", got, test.want)
++			}
++		})
++	}
++}
++
++func TestMixerThinkingRejectsUnprovenOrRoundedLevels(t *testing.T) {
++	budget := int64(1024)
++	for _, test := range []struct {
++		name, effort string
++		capability   bool
++		levels       []int64
++		budget       *int64
++	}{
++		{"nearest lower is not medium", "medium", true, []int64{1, 3}, nil},
++		{"missing enum list", "low", true, nil, nil},
++		{"missing capability", "low", false, []int64{1}, nil},
++		{"alias max is not exact", "max", true, []int64{3}, nil},
++		{"none is not minimal", "none", true, []int64{4}, nil},
++		{"budget conflicts with level", "low", true, []int64{1}, &budget},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			observed := "previous-account-value"
++			ctx := ContextWithMixerThinkingObserver(ContextWithMixerChannel(context.Background(), ChannelPlayground), func(level string) { observed = level })
++			err := ValidateMixerThinking(ctx, GenerationConfig{ReasoningEffort: test.effort, ThinkingBudget: test.budget}, GenerationDefaults{ThinkingLevel: test.capability, ThinkingLevels: test.levels})
++			if !errors.Is(err, ErrInvalidArgument) || observed != "" {
++				t.Fatalf("error=%v observed=%q", err, observed)
++			}
++		})
++	}
++	// Upstream's ordinary compatibility mode is deliberately unchanged.
++	defaults := GenerationDefaults{MaxOutputTokens: 1024, ThinkingLevel: true, ThinkingLevels: []int64{1, 3}}
++	config := GenerationConfig{ReasoningEffort: "medium"}
++	if err := ValidateMixerThinking(context.Background(), config, defaults); err != nil {
++		t.Fatal(err)
++	}
++	wire, err := encodeGenerationConfig(config, defaults)
++	if err != nil || wire[16].([]any)[3] != int64(1) {
++		t.Fatalf("unlocked compatibility changed: %v %v", wire, err)
++	}
++}
++
++func TestMixerThinkingExactLevelsReachBothWireFormats(t *testing.T) {
++	defaults := GenerationDefaults{MaxOutputTokens: 1024, Thinking: true, ThinkingLevel: true, ThinkingLevels: []int64{1, 2, 3}}
++	for level, name := range map[int64]string{1: "LOW", 2: "MEDIUM", 3: "HIGH"} {
++		t.Run(name, func(t *testing.T) {
++			request := GenerateRequest{Model: "fixture", Contents: []Content{{Role: RoleUser, Parts: []Part{{Text: "synthetic prompt"}}}}, Config: GenerationConfig{ReasoningEffort: name}}
++			for _, channel := range []Channel{ChannelPlayground, ChannelBuild} {
++				observed := ""
++				ctx := ContextWithMixerThinkingObserver(ContextWithMixerChannel(context.Background(), channel), func(value string) { observed = value })
++				if err := ValidateMixerThinking(ctx, request.Config, defaults); err != nil || observed != name {
++					t.Fatalf("validation=%q error=%v", observed, err)
++				}
++			}
++			encoded, err := EncodeGenerateContentRequest(request, defaults, RequestContext{})
++			if err != nil {
++				t.Fatal(err)
++			}
++			var playground []any
++			if err := json.Unmarshal(encoded, &playground); err != nil {
++				t.Fatal(err)
++			}
++			if got := playground[3].([]any)[16].([]any)[3]; got != float64(level) {
++				t.Fatalf("Playground wire level=%v", got)
++			}
++			_, encoded, err = EncodeBuildGenerateRequest(request, defaults, false, true)
++			if err != nil {
++				t.Fatal(err)
++			}
++			var build map[string]any
++			if err := json.Unmarshal(encoded, &build); err != nil {
++				t.Fatal(err)
++			}
++			if got := build["generationConfig"].(map[string]any)["thinkingConfig"].(map[string]any)["thinkingLevel"]; got != name {
++				t.Fatalf("Build wire level=%v", got)
++			}
++		})
++	}
++}
++
++func TestMixerGenerateChecksActualAccountBeforeProtectedTransport(t *testing.T) {
++	for _, channel := range []Channel{ChannelPlayground, ChannelBuild} {
++		t.Run(string(channel), func(t *testing.T) {
++			entry := modelEntry{model: Model{ID: "fixture"}, defaults: GenerationDefaults{ThinkingLevel: true, ThinkingLevels: []int64{3}}}
++			called := false
++			client := &Client{
++				catalogs: map[string]modelCatalog{"selected": {entries: map[string]modelEntry{"fixture": entry}}},
++				protected: ProtectedTransportFunc(func(context.Context, GenerateRequest, RPCRequest) (*RPCResponse, error) {
++					called = true
++					return nil, errors.New("unexpected transport")
++				}),
++			}
++			lease := &AccountLease{account: &Account{ID: "selected"}, channel: channel}
++			ctx := ContextWithAccountLease(ContextWithMixerChannel(context.Background(), channel), lease)
++			_, err := client.Generate(ctx, GenerateRequest{AccountID: "selected", Model: "fixture", Config: GenerationConfig{ReasoningEffort: "medium"}})
++			if !errors.Is(err, ErrInvalidArgument) || called {
++				t.Fatalf("error=%v transportCalled=%v", err, called)
++			}
++		})
++	}
++}
+diff --git a/internal/aistudio/models.go b/internal/aistudio/models.go
+index 879eb64..7c15314 100644
+--- a/internal/aistudio/models.go
++++ b/internal/aistudio/models.go
+@@ -211,6 +211,20 @@ func decodeModelRow(raw json.RawMessage, rowIndex int) (modelEntry, error) {
+ 	if err != nil {
+ 		return modelEntry{}, err
+ 	}
++	if defaults.ThinkingLevel {
++		if model.CapabilityOptions == nil {
++			model.CapabilityOptions = make(map[string][]string)
++		}
++		// Only publish the exact known enum values returned by ListModels.
++		// An empty list is deliberately not inferred from the capability flag.
++		levels := []string{}
++		for _, level := range defaults.ThinkingLevels {
++			if name, known := catalogThinkingLevelNames[level]; known {
++				levels = append(levels, name)
++			}
++		}
++		model.CapabilityOptions["thinking_levels"] = levels
++	}
+ 	if capabilities["output_continuation"] {
+ 		defaults.ContinuedOutputTokens = inputLimit
+ 	}
 diff --git a/internal/aistudio/runtime_go.go b/internal/aistudio/runtime_go.go
 index 06b0a5d..638dc18 100644
 --- a/internal/aistudio/runtime_go.go
@@ -600,15 +840,16 @@ index 333779f..5a120aa 100644
  			return StorageState{}, nil, fmt.Errorf("账户动态公共头缺少 %s", name)
 diff --git a/internal/api/mixer_channel.go b/internal/api/mixer_channel.go
 new file mode 100644
-index 0000000..82923d7
+index 0000000..2062b5a
 --- /dev/null
 +++ b/internal/api/mixer_channel.go
-@@ -0,0 +1,59 @@
+@@ -0,0 +1,111 @@
 +package api
 +
 +import (
 +	"net/http"
 +	"strings"
++	"sync"
 +
 +	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
 +)
@@ -646,9 +887,60 @@ index 0000000..82923d7
 +			writeOpenAIError(w, http.StatusBadRequest, "unsupported_channel_route", "Channel locking is supported only for model discovery and ordinary generation")
 +			return
 +		}
-+		next.ServeHTTP(w, r.WithContext(aistudio.ContextWithMixerChannel(r.Context(), channel)))
++		ctx := aistudio.ContextWithMixerChannel(r.Context(), channel)
++		response := &mixerThinkingResponseWriter{ResponseWriter: w}
++		ctx = aistudio.ContextWithMixerThinkingObserver(ctx, response.observe)
++		next.ServeHTTP(response, r.WithContext(ctx))
 +	})
 +}
++
++// Generation can start in a choice goroutine. Keep observations separate from
++// the HTTP header map and publish the current validation only when headers commit.
++type mixerThinkingResponseWriter struct {
++	http.ResponseWriter
++	mu          sync.Mutex
++	level       string
++	wroteHeader bool
++}
++
++func (w *mixerThinkingResponseWriter) observe(level string) {
++	w.mu.Lock()
++	w.level = level
++	w.mu.Unlock()
++}
++
++func (w *mixerThinkingResponseWriter) WriteHeader(status int) {
++	if w.wroteHeader {
++		return
++	}
++	w.wroteHeader = true
++	w.mu.Lock()
++	level := w.level
++	w.mu.Unlock()
++	w.Header().Del("X-Mixer-Thinking-Level")
++	w.Header().Del("X-Mixer-Thinking-Validation")
++	if level != "" {
++		w.Header().Set("X-Mixer-Thinking-Level", level)
++		w.Header().Set("X-Mixer-Thinking-Validation", "account-catalog")
++	}
++	w.ResponseWriter.WriteHeader(status)
++}
++
++func (w *mixerThinkingResponseWriter) Write(body []byte) (int, error) {
++	if !w.wroteHeader {
++		w.WriteHeader(http.StatusOK)
++	}
++	return w.ResponseWriter.Write(body)
++}
++
++func (w *mixerThinkingResponseWriter) FlushError() error {
++	if !w.wroteHeader {
++		w.WriteHeader(http.StatusOK)
++	}
++	return http.NewResponseController(w.ResponseWriter).Flush()
++}
++
++func (w *mixerThinkingResponseWriter) Unwrap() http.ResponseWriter { return w.ResponseWriter }
 +
 +func mixerChannelRoute(r *http.Request) bool {
 +	if r.Method == http.MethodGet {
@@ -665,10 +957,10 @@ index 0000000..82923d7
 +}
 diff --git a/internal/api/mixer_channel_test.go b/internal/api/mixer_channel_test.go
 new file mode 100644
-index 0000000..a05c67b
+index 0000000..4477aa3
 --- /dev/null
 +++ b/internal/api/mixer_channel_test.go
-@@ -0,0 +1,60 @@
+@@ -0,0 +1,106 @@
 +package api
 +
 +import (
@@ -725,6 +1017,52 @@ index 0000000..a05c67b
 +			}
 +			if w.Code == 401 && w.Header().Get("X-Mixer-Channel-Locked") != "" {
 +				t.Fatal("unauthenticated lock acknowledgment")
++			}
++		})
++	}
++}
++
++func TestMixerThinkingMetadataRequiresActualCatalogValidation(t *testing.T) {
++	for _, test := range []struct {
++		name                        string
++		validate, supported, stream bool
++	}{
++		{"not validated", false, false, false},
++		{"rejected", true, false, false},
++		{"nonstream", true, true, false},
++		{"stream", true, true, true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			handler := authMiddleware("secret", mixerChannelMiddleware("secret", http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				if test.validate {
++					levels := []int64{3}
++					if test.supported {
++						levels = []int64{1, 2, 3}
++					}
++					if err := aistudio.ValidateMixerThinking(r.Context(), aistudio.GenerationConfig{ReasoningEffort: "MEDIUM"}, aistudio.GenerationDefaults{ThinkingLevel: true, ThinkingLevels: levels}); err != nil {
++						w.WriteHeader(http.StatusBadRequest)
++						return
++					}
++				}
++				if test.stream {
++					if err := http.NewResponseController(w).Flush(); err != nil {
++						t.Fatal(err)
++					}
++				}
++				_, _ = w.Write([]byte("synthetic response"))
++			})))
++			r := httptest.NewRequest(http.MethodPost, "/v1beta/models/fixture:generateContent", nil)
++			r.Header.Set("Authorization", "Bearer secret")
++			r.Header.Set(mixerChannelHeader, "playground")
++			w := httptest.NewRecorder()
++			handler.ServeHTTP(w, r)
++			headers := w.Result().Header
++			if test.validate && test.supported {
++				if headers.Get("X-Mixer-Thinking-Level") != "MEDIUM" || headers.Get("X-Mixer-Thinking-Validation") != "account-catalog" {
++					t.Fatal("missing catalog validation metadata")
++				}
++			} else if headers.Get("X-Mixer-Thinking-Level") != "" || headers.Get("X-Mixer-Thinking-Validation") != "" {
++				t.Fatal("unvalidated effort acknowledged")
 +			}
 +		})
 +	}

@@ -225,7 +225,9 @@ def _thinking(entry, proof):
     caps = entry.get("capabilities", {})
     options = entry.get("capability_options", {})
     levels = options.get("thinking_levels", []) if isinstance(options, dict) else []
-    levels = {v.lower() for v in levels if isinstance(v, str)} if isinstance(levels, list) else set()
+    levels = ({v.lower() for v in levels} if isinstance(levels, list)
+              and all(isinstance(v, str) and v.lower() in ("minimal", "low", "medium", "high") for v in levels)
+              else set())
     result = {}
     raw = proof.get("thinking", {})
     if not isinstance(raw, dict):
@@ -237,7 +239,7 @@ def _thinking(entry, proof):
         if set(config) == {"thinkingLevel"}:
             value = config["thinkingLevel"]
             if (caps.get("thinking_level") is True and isinstance(value, str)
-                    and value.lower() == effort and (not levels or effort in levels)):
+                    and value.lower() == effort and effort in levels):
                 result[effort] = {"thinkingLevel": value.upper()}
         elif set(config) == {"thinkingBudget"}:
             value = config["thinkingBudget"]
@@ -370,13 +372,14 @@ class SidecarRoute:
         return self.meta
 
     def generate(self, native_body):
-        data = self._encoded(self.prepare(native_body))
+        body = self.prepare(native_body)
+        data = self._encoded(body)
         with _new_client(_timeout(self._bounds)) as client:
             with _SidecarDeadline(client, self._bounds.total) as deadline:
                 try:
                     with client.stream("POST", self.base + "/v1beta/models/" + self.model + ":generateContent",
                                        headers=_headers(self._key, self.channel), content=data) as response:
-                        _check_response(response, self.channel)
+                        self._check_generation_response(response, body)
                         return self._validate_result(_read(response, deadline, self._bounds.response_bytes), True)
                 except (httpx.HTTPError, OSError, RuntimeError) as error:
                     raise _safe_exception(error, deadline) from None
@@ -384,13 +387,14 @@ class SidecarRoute:
     def stream(self, native_body):
         if not self.capabilities["streaming"]:
             raise _error(400, "unsupported_streaming", "Streaming has not been verified for this AI Studio channel/model.")
-        data = self._encoded(self.prepare(native_body))
+        body = self.prepare(native_body)
+        data = self._encoded(body)
         with _new_client(_timeout(self._bounds)) as client:
             with _SidecarDeadline(client, self._bounds.total) as deadline:
                 try:
                     with client.stream("POST", self.base + "/v1beta/models/" + self.model + ":streamGenerateContent",
                                        params={"alt": "sse"}, headers=_headers(self._key, self.channel, True), content=data) as response:
-                        _check_response(response, self.channel)
+                        self._check_generation_response(response, body)
                         if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "text/event-stream":
                             raise _error(502, "upstream_invalid_stream", "The AI Studio backend did not return SSE.")
                         terminal = False
@@ -409,6 +413,16 @@ class SidecarRoute:
                     # Shared parser diagnostics name the public provider; keep
                     # client-visible failures specific to this transport.
                     raise _error(error.status, error.code, "The AI Studio backend stream failed validation or exceeded a transport limit.") from None
+
+    def _check_generation_response(self, response, body):
+        _check_response(response, self.channel)
+        level = body.get("generationConfig", {}).get("thinkingConfig", {}).get("thinkingLevel")
+        if level is not None and (response.headers.get("X-Mixer-Thinking-Level") != level
+                                  or response.headers.get("X-Mixer-Thinking-Validation") != "account-catalog"):
+            # A previously verified mapping must not conceal a downgraded backend
+            # or an account whose current catalogue silently clamps the level.
+            raise _error(502, "upstream_thinking_not_verified",
+                         "The AI Studio backend did not verify the requested thinking level against the selected account catalogue.")
 
 
 def resolve_route(source, alias, effort=None):

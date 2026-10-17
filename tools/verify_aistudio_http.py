@@ -2,7 +2,8 @@
 
 No session files are read. Credentials come only from AISTUDIO_HTTP_API_KEY.
 The output contains status, timing, and counts, never generated text or errors
-from the backend. There are no retries and no thinking/tool/image claims.
+from the backend. Thinking levels require an explicit, catalogue-backed probe;
+there are no retries or tool/image claims.
 """
 from __future__ import annotations
 
@@ -27,6 +28,9 @@ BODY = {"contents": [{"role": "user", "parts": [{"text": PROMPT}]}]}
 MAX_RESPONSE = 1024 * 1024
 MAX_EVENT = 128 * 1024
 STOP_CODES = frozenset({"upstream_authentication_failed", "upstream_rate_limited"})
+THINKING_LEVELS = ("low", "medium", "high")
+CATALOG_THINKING_LEVELS = frozenset((*THINKING_LEVELS, "minimal"))
+CATALOG_TIMEOUT = 15
 
 
 class ProbeError(Exception):
@@ -63,8 +67,15 @@ def config(environ):
 def decode(data):
     def invalid_constant(_value):
         raise ValueError
+    def unique_object(pairs):
+        value = {}
+        for key, item in pairs:
+            if key in value:
+                raise ValueError
+            value[key] = item
+        return value
     try:
-        value = json.loads(data, parse_constant=invalid_constant)
+        value = json.loads(data, parse_constant=invalid_constant, object_pairs_hook=unique_object)
         if not isinstance(value, dict):
             raise ValueError
     except (ValueError, TypeError, UnicodeError, RecursionError):
@@ -90,12 +101,57 @@ def status_error(status):
     return ProbeError("upstream_request_failed", status)
 
 
-def check_response(response, channel):
+def check_response(response, channel, thinking_level=None):
     if response.status_code != 200:
         raise status_error(response.status_code)
     if (response.headers.get("X-Mixer-Upstream-Channel") != channel
             or response.headers.get("X-Mixer-Channel-Locked") != "1"):
         raise ProbeError("upstream_channel_not_locked", response.status_code)
+    if thinking_level is not None and (
+            response.headers.get("X-Mixer-Thinking-Level") != thinking_level.upper()
+            or response.headers.get("X-Mixer-Thinking-Validation") != "account-catalog"):
+        raise ProbeError("upstream_thinking_not_confirmed", response.status_code)
+
+
+def check_thinking_catalog(response, deadline, model, thinking_level, channel):
+    check_response(response, channel)
+    if response.headers.get("content-type", "").split(";", 1)[0].strip().lower() != "application/json":
+        raise ProbeError("invalid_model_catalog")
+    catalog = read_json(response, deadline)
+    entries = catalog.get("data")
+    if catalog.get("object") != "list" or not isinstance(entries, list) or len(entries) > 4096:
+        raise ProbeError("invalid_model_catalog")
+    selected, seen = None, set()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise ProbeError("invalid_model_catalog")
+        identifier = entry.get("id")
+        if (not isinstance(identifier, str) or not identifier or len(identifier) > 256
+                or identifier in seen):
+            raise ProbeError("invalid_model_catalog")
+        seen.add(identifier)
+        if identifier == model:
+            selected = entry
+    if selected is None:
+        raise ProbeError("upstream_model_not_found")
+    channels = selected.get("channels")
+    if (not isinstance(channels, list) or not channels
+            or any(not isinstance(item, str) or item not in CHANNELS.values() for item in channels)
+            or len(set(channels)) != len(channels)):
+        raise ProbeError("invalid_model_catalog")
+    if channel not in channels:
+        raise ProbeError("upstream_model_channel_unavailable")
+    capabilities, options = selected.get("capabilities"), selected.get("capability_options")
+    if (not isinstance(capabilities, dict) or capabilities.get("thinking_level") is not True
+            or not isinstance(options, dict)):
+        raise ProbeError("unsupported_thinking_level")
+    levels = options.get("thinking_levels")
+    if (not isinstance(levels, list) or not levels or len(levels) > len(CATALOG_THINKING_LEVELS)
+            or any(not isinstance(level, str) or level not in CATALOG_THINKING_LEVELS for level in levels)
+            or len(set(levels)) != len(levels)):
+        raise ProbeError("invalid_thinking_catalog")
+    if thinking_level not in levels:
+        raise ProbeError("unsupported_thinking_level")
 
 
 def answer(value, require_terminal=False):
@@ -249,7 +305,7 @@ def check_stream(response, deadline, started):
             "incremental_delivery_observed": True}
 
 
-def probe(base, key, model, source, stream, total_timeout, client_factory=httpx.Client):
+def probe(base, key, model, source, stream, total_timeout, client_factory=httpx.Client, thinking_level=None):
     started = time.monotonic()
     channel = CHANNELS[source]
     method = "streamGenerateContent" if stream else "generateContent"
@@ -258,12 +314,26 @@ def probe(base, key, model, source, stream, total_timeout, client_factory=httpx.
     summary = {"ok": False}
     deadline = None
     try:
+        if thinking_level is not None and thinking_level not in THINKING_LEVELS:
+            raise ProbeError("invalid_probe_arguments")
+        body = BODY
+        if thinking_level is not None:
+            body = dict(BODY, generationConfig={"thinkingConfig": {"thinkingLevel": thinking_level.upper()}})
         with client_factory(timeout=httpx.Timeout(total_timeout, connect=min(10, total_timeout)),
                             follow_redirects=False, trust_env=False, verify=True) as client:
+            if thinking_level is not None:
+                with Deadline(client, min(total_timeout, CATALOG_TIMEOUT)) as deadline:
+                    # Fixed path on the same configured origin; never follow a
+                    # catalogue URL or redirect supplied in a response.
+                    with client.stream("GET", base + "/v1/models",
+                                       headers={"Authorization": "Bearer " + key, "Accept": "application/json",
+                                                "X-Mixer-Upstream-Channel": channel},
+                                       timeout=min(total_timeout, CATALOG_TIMEOUT)) as response:
+                        check_thinking_catalog(response, deadline, model, thinking_level, channel)
             with Deadline(client, total_timeout) as deadline:
                 with client.stream("POST", base + "/v1beta/models/" + model + ":" + method,
-                                   params={"alt": "sse"} if stream else None, headers=headers, json=BODY) as response:
-                    check_response(response, channel)
+                                   params={"alt": "sse"} if stream else None, headers=headers, json=body) as response:
+                    check_response(response, channel, thinking_level)
                     if stream:
                         details = check_stream(response, deadline, started)
                     else:
@@ -272,6 +342,8 @@ def probe(base, key, model, source, stream, total_timeout, client_factory=httpx.
                             raise ProbeError("empty_generation_result")
                         details = {"text_chars": len(text), "terminal_status": "STOP"}
                     summary.update(details, ok=True, status=200, channel_locked=True)
+                    if thinking_level is not None:
+                        summary.update(thinking_level=thinking_level, thinking_validation="account-catalog")
     except ProbeError as error:
         summary.update(code=error.code, status=error.status)
     except (httpx.HTTPError, OSError, RuntimeError, ValueError) as error:
@@ -284,11 +356,12 @@ def probe(base, key, model, source, stream, total_timeout, client_factory=httpx.
     return summary
 
 
-def write_evidence(path, base, model, sources):
+def write_evidence(path, base, model, sources, thinking_level=None):
     if not sources:
         return False
+    thinking = {} if thinking_level is None else {thinking_level: {"thinkingLevel": thinking_level.upper()}}
     entries = {source + "/" + model: {"text": True, "streaming": True, "image_input": False,
-                                      "tools": False, "parameters": [], "thinking": {}} for source in sources}
+                                      "tools": False, "parameters": [], "thinking": thinking} for source in sources}
     data = {"version": 1, "backend_base_url": base,
             "verified_at": datetime.now(timezone.utc).isoformat(), "models": entries}
     destination = Path(path)
@@ -313,22 +386,27 @@ def write_evidence(path, base, model, sources):
             os.unlink(temporary)
 
 
-def run(model, sources, timeout, environ, evidence_output=None, evidence_base_url=None, client_factory=httpx.Client):
+def run(model, sources, timeout, environ, evidence_output=None, evidence_base_url=None, client_factory=httpx.Client,
+        thinking_level=None):
     if not MODEL_RE.fullmatch(model) or len(model) > 160 or not 1 <= timeout <= 180:
         raise ProbeError("invalid_probe_arguments")
     if not sources or len(set(sources)) != len(sources) or any(source not in CHANNELS for source in sources):
         raise ProbeError("invalid_probe_arguments")
+    if thinking_level is not None and thinking_level not in THINKING_LEVELS:
+        raise ProbeError("invalid_probe_arguments")
     base, key, allow_http = config(environ)
     evidence_base = valid_base(evidence_base_url, allow_http) if evidence_base_url else base
     result = {"ok": False, "model": model, "results": [], "evidence_written": False, "evidence_sources": []}
+    if thinking_level is not None:
+        result["thinking_level"] = thinking_level
     passed = []
     for source in sources:
         item = {"source": source, "channel": CHANNELS[source]}
         result["results"].append(item)
-        item["non_stream"] = probe(base, key, model, source, False, timeout, client_factory)
+        item["non_stream"] = probe(base, key, model, source, False, timeout, client_factory, thinking_level)
         failure = item["non_stream"]
         if item["non_stream"]["ok"]:
-            item["stream"] = probe(base, key, model, source, True, timeout, client_factory)
+            item["stream"] = probe(base, key, model, source, True, timeout, client_factory, thinking_level)
             failure = item["stream"]
             if item["stream"]["ok"]:
                 passed.append(source)
@@ -338,7 +416,7 @@ def run(model, sources, timeout, environ, evidence_output=None, evidence_base_ur
     if evidence_output:
         # Replace with only this run's proven entries. Merging would refresh
         # unrelated stale evidence because version 1 has a global timestamp.
-        result["evidence_written"] = write_evidence(evidence_output, evidence_base, model, passed)
+        result["evidence_written"] = write_evidence(evidence_output, evidence_base, model, passed, thinking_level)
         result["evidence_sources"] = passed if result["evidence_written"] else []
     result["ok"] = len(passed) == len(sources)
     return result
@@ -348,13 +426,15 @@ def main(argv=None):
     parser = argparse.ArgumentParser(description="Probe two AI Studio channels without retries or private prompt data.")
     parser.add_argument("--model", required=True, help="Exact upstream model ID, without ais-/build- prefixes")
     parser.add_argument("--source", choices=("all", "ais", "build"), default="all")
+    parser.add_argument("--thinking-level", choices=THINKING_LEVELS,
+                        help="Explicit native thinking level; requires catalogue and account validation")
     parser.add_argument("--timeout", type=float, default=60, help="Wall-clock limit per request, 1–180 seconds")
     parser.add_argument("--evidence-output", help="Replace this JSON with successful entries from this run only")
     parser.add_argument("--evidence-base-url", help="Optional backend URL as addressed from the Mixer container")
     args = parser.parse_args(argv)
     try:
         result = run(args.model, list(CHANNELS) if args.source == "all" else [args.source], args.timeout, os.environ,
-                     args.evidence_output, args.evidence_base_url)
+                     args.evidence_output, args.evidence_base_url, thinking_level=args.thinking_level)
     except ProbeError as error:
         result = {"ok": False, "code": error.code, "evidence_written": False}
     except Exception:

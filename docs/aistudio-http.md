@@ -11,8 +11,11 @@
 
 ## 本机实测状态（2026-10-17）
 
-两个自有账号已主动导入；分别使用所选会话读取 AI Studio 官方页面，页面邮箱与导出信息匹配。
-关闭全部 Edge 进程后，`gemini-3.8-flash` 的 AIS、Build 两通道均完成以下验证：
+当前已主动导入五个自有账号；新增的三个账号也完成官方 AI Studio 页面读取，
+五个账号的页面邮箱均与各自导出信息匹配。当前保留 `2 warm / 2 active` 以控制内存，
+五账号导入完成不代表五账号都已生成成功或已验证全部轮询。
+
+此前的两账号阶段，关闭全部 Edge 进程后，`gemini-3.8-flash` 的 AIS、Build 两通道均完成以下验证：
 
 | 入口 | AIS 文本 / SSE | Build 文本 / SSE |
 | --- | --- | --- |
@@ -35,15 +38,51 @@ SSE HTTP 200，首段文本 15.657 秒、终态 16.188 秒，共 3 个内容事�
 状态 200，但这不表示客户端收到成功结果。随后仅重测此 AIS 外网请求，将客户端总时限设为 180 秒，
 得到上述完整成功结果。
 Build 的同模型返回 HTTP 429 后已停止探测，**未启用 `build-gemini-4-argon`**。
-不能根据这些结果推算剩余额度，也没有验证或启用上述模型的 low / medium / high 档位。
+这些初始基础模型测试没有验证思考档位；后续 AIS Argon 三档的独立验证见下文。
+不能根据生成成功推算剩余额度或重置时间。
 
-修复官方规范账号路径跳转的补丁配合 `2 warm / 2 active` 配置，已通过真实轮询验证：
+此前两账号阶段，修复官方规范账号路径跳转的补丁配合 `2 warm / 2 active` 配置，已通过真实轮询验证：
 连续四次同一 AIS 来源、同一 Flash 模型的请求均为 HTTP 200，后端账本明确记录
 `account-index-1 → account-index-0 → account-index-1 → account-index-0`，每次均无失败尝试。
 本机与外网的 `/healthz`、`/quota`、认证后的 `/v1/models`、`/v1/quota` 均为 HTTP 200；
-模型目录含 30 条，未授权的数据接口返回 401，Sub2API 原入口仍为 HTTP 200。
-自动化检查为 Python **338 项**、Node **41 项**及 **4 个 Go 包测试套件**通过。
+该阶段模型目录含 30 条，未授权的数据接口返回 401，Sub2API 原入口仍为 HTTP 200。
+当前自动化检查为 Python **356 项**及 **4 个 Go 包测试套件**通过；
+Node **41 项**通过的记录沿用此前未变更的扩展实现。
 当前镜像、补丁校验值和分阶段记录见 [验证记录](../sidecars/aistudio2api/VALIDATION.md)。
+
+### AIS Argon 思考档位
+
+`gemini-4-argon` 的真实 `ListModels` 目录明确列出 `high`、`low`、`medium`。
+对 AIS/Playground 的每一档分别执行原生文本和 SSE 生成，六次均为 HTTP 200，
+均收到精确档位和 `account-catalog` 确认。SSE 每档均有 3 个内容事件、5 次读取，
+得到 110 字符及 `STOP` 终态，观察到不同读取批次的增量到达。
+
+| 档位 | 文本耗时 | SSE 首段文本 | SSE 终态 |
+| --- | --- | --- | --- |
+| low | 17.344 秒 | 8.297 秒 | 8.875 秒 |
+| medium | 28.578 秒 | 14.828 秒 | 15.469 秒 |
+| high | 7.906 秒 | 13.782 秒 | 14.157 秒 |
+
+三条别名 `ais-gemini-4-argon-low`、`ais-gemini-4-argon-medium`、
+`ais-gemini-4-argon-high` 已启用，当前模型目录共 33 条。
+Go 后端在选中实际账号后严格检查其目录；合成 wire 测试验证精确 enum 和字段传递，
+Mixer 拒绝缺少或不匹配的档位确认。以上证明受支持参数的精确传递与生成成功，
+不表示 Google 回显内部计算量，也不能用这组耗时比较三档的计算强度。
+当前仅启用 AIS 三档；Build Argon 保持 429 后停用状态。
+
+后端六次原生验收之外，现有 OpenFRP 外网入口又分别通过以下三项 Mixer 验证：
+
+| 档位与输入方式 | Mixer API | 结果 |
+| --- | --- | --- |
+| `ais-gemini-4-argon-low` 别名 | Chat Completions SSE | HTTP 200，首段 25.578 秒，总耗时 26.360 秒，3 个内容事件及 `STOP` / `[DONE]` |
+| 基础模型 + `reasoning.effort=medium` | Responses 非流式 | HTTP 200，`completed`，总耗时 24.515 秒 |
+| 基础模型 + `thinkingConfig.thinkingLevel=HIGH` | Gemini 原生 SSE | HTTP 200，首段 10.063 秒，总耗时 10.500 秒，3 个内容事件及 `STOP` |
+
+三项的 `x_mixer` 来源均为 AIS，有效档位分别准确为 low、medium、high；
+外网 `/v1/models` 实际返回 33 条，含 Argon 基础模型及三个档位别名。
+最新本机和外网 `/healthz`、`/quota`、认证后的 `/v1/models`、`/v1/quota` 均为 HTTP 200，
+未授权数据接口为 401，Sub2API 原入口为 200。这是三个代表性外网入口用例，
+并非三档与三种 API、文本和 SSE 的全部组合均已实测。
 
 ## 来源锁定与凭据
 
@@ -108,6 +147,14 @@ docker compose -f compose.yml -f compose.aistudio.yml up -d --build
 `/v1/models` 是后端声明与本地允许列表的交集，不证明生成额度。
 流式、思考档位、图像和工具还需要当前有效的实测记录。
 记录分别使用 `ais/<model>`、`build/<model>`，不得跨通道套用。
+
+显式 `thinkingLevel` 还要求目录的 `capability_options.thinking_levels` 明确列出该档位，
+只声明 `thinking_level=true` 不够。Go 后端在选定实际账号后再次检查其目录，
+拒绝将档位静默替换为相近值，或丢弃档位使用默认值。
+Mixer 对每次响应核对 `X-Mixer-Thinking-Level` 和
+`X-Mixer-Thinking-Validation: account-catalog`；缺失或不一致返回 502。
+这表示精确参数已通过所选账号目录校验并被发送，不是 Google 返回的内部计算量证明。
+公开 API 档位映射不自动套用到此网页会话通道。
 
 ```json
 {
