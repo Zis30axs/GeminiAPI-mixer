@@ -100,9 +100,9 @@ class QuotaDashboardTests(unittest.TestCase):
     def test_operator_http_origins_are_canonical_exact_origins(self):
         html, csp = render_dashboard({"MIXER_DASHBOARD_HTTP_ORIGINS": (
             " http://EXAMPLE.test:80 , http://[2001:0db8::1]:8080,"
-            "http://127.0.0.1:8080,http://jp-tyo-bgp-1.ofalias.net:60941,http://example.test "
+            "http://127.0.0.1:8080,http://frp.example.test:60000,http://example.test "
         )})
-        self.assertEqual(self.origins(html), ["http://example.test", "http://[2001:db8::1]:8080", "http://127.0.0.1:8080", "http://jp-tyo-bgp-1.ofalias.net:60941"])
+        self.assertEqual(self.origins(html), ["http://example.test", "http://[2001:db8::1]:8080", "http://127.0.0.1:8080", "http://frp.example.test:60000"])
         self.assertNotEqual(csp, CONTENT_SECURITY_POLICY)
         self.assert_script_hash(html, csp)
         self.assertNotIn("__MIXER_DASHBOARD_HTTP_ORIGINS__", html)
