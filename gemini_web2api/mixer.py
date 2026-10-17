@@ -16,6 +16,7 @@ from .server import GeminiHandler
 from .providers import ProviderError, list_models, resolve_route
 from .api_formats import to_native, format_result, stream_events
 from . import antigravity
+from . import aistudio_http
 from .quota_dashboard import render_dashboard
 
 
@@ -213,7 +214,9 @@ class MixerHandler(GeminiHandler):
                     self.send_json({"models": [dict(m, name="models/" + m["id"],
                         displayName=m["id"], supportedGenerationMethods=(
                             [] if m.get("source") == "antigravity" else
-                            ["generateContent", "streamGenerateContent"])) for m in models]})
+                            ["generateContent"] + (["streamGenerateContent"] if
+                                m.get("transport") != aistudio_http.TRANSPORT or
+                                m.get("capabilities", {}).get("streaming") is True else []))) for m in models]})
             elif path in ("/v1/quota", "/v1/quota/antigravity"):
                 self.send_json(antigravity.quota())
             else:
@@ -270,9 +273,12 @@ class MixerHandler(GeminiHandler):
                 raise ProviderError(400, "thinking_conflict", "reasoning_effort and reasoning.effort conflict")
             effort = first_effort if first_effort is not None else second_effort
             if alias.startswith(("build-", "ais-")):
-                self._metadata = {"source": alias.split("-", 1)[0],
+                source = alias.split("-", 1)[0]
+                self._metadata = {"source": source,
                                   "transport": "google-gemini-public-api", "request_id": self._request_id,
                                   "profile_kind": "logical-public-api-profile", "webpage_executor": False}
+                if aistudio_http.transport_mode(source) == aistudio_http.TRANSPORT:
+                    self._metadata = dict(aistudio_http.initial_metadata(source), request_id=self._request_id)
             route = resolve_route(alias, effort=effort)
             if route is None:
                 if not web_enabled():
@@ -297,8 +303,10 @@ class MixerHandler(GeminiHandler):
                     self.path = old_path
                 return
             self._metadata = dict(route.meta, request_id=self._request_id)
-            self._route_log(alias, stream)
             request = to_native(req, kind)
+            if hasattr(route, "request_metadata"):
+                self._metadata = dict(route.request_metadata(request), request_id=self._request_id)
+            self._route_log(alias, stream)
             if stream:
                 chunks = route.stream(request)
                 try:
@@ -328,11 +336,14 @@ class MixerHandler(GeminiHandler):
             self._fail(ProviderError(502, "upstream_error", "Provider request failed"))
 
     def _route_log(self, alias, stream):
-        log("route request_id=%s source=%s transport=%s model=%s upstream_model=%s effective_upstream_model=%s effort=%s stream=%s" %
+        log("route request_id=%s source=%s transport=%s model=%s upstream_model=%s effective_upstream_model=%s effort=%s stream=%s upstream_channel=%s thinking_level=%s thinking_budget=%s" %
             (self._request_id, self._metadata["source"], self._metadata["transport"], alias,
              self._metadata.get("upstream_model") or "unknown",
              self._metadata.get("effective_upstream_model", self._metadata.get("upstream_model")) or "unknown",
-             self._metadata.get("requested_effort") or "default", stream))
+             self._metadata.get("requested_effort") or "default", stream,
+             self._metadata.get("upstream_channel") or "default",
+             self._metadata.get("effective_thinking_level") or "default",
+             self._metadata.get("effective_thinking_budget", "default")))
 
     def _stream_error(self, error):
         self._fail(ProviderError(502, "web_upstream_error", "Gemini Web stream failed"))

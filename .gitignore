@@ -19,3 +19,5 @@ diagnostics/
 .idea
 .DS_Store
 gemini-auth.json
+storage-state.json
+aistudio-session-*.json

@@ -28,6 +28,13 @@
 公开 Provider 固定 Google HTTPS host、校验证书、不跟随重定向、不使用环境代理、
 不自动重试生成请求；不接受客户端设置上游 URL 或上游认证头。
 
+## 可选纯 Go AI Studio 会话模式
+
+`compose.aistudio.yml` 可把 `ais-` 和 `build-` 切到用户自托管、正常认证的网页会话后端。
+该模式无需公开 Gemini API key，运行时不安装或启动浏览器。它使用固定版本私有协议实现，
+必须单独验证账号权益和实际能力；操作和多账号设置见 [部署说明](aistudio-http.md)。
+下文未特别标注的 build/ais 行为仍描述默认公开 API 模式。
+
 ## Compose
 
 复制 `.env.example` 为 `.env` 并填写后执行 `docker compose up --build -d`。

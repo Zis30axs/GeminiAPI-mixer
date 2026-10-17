@@ -1,6 +1,6 @@
 # GeminiAPI Mixer
 
-保留现有 Gemini Web Provider，按模型前缀路由到 AI Studio 公共 API 配置，
+保留现有 Gemini Web Provider，按模型前缀路由到 AI Studio 公共 API 或自托管纯 Go 会话后端，
 并可连接自托管 Sub2API 的 Antigravity 专属分组。提供 Chat Completions、
 Responses、Gemini 原生 API、SSE 和带来源信息的模型列表。
 
@@ -9,13 +9,15 @@ Responses、Gemini 原生 API、SSE 和带来源信息的模型列表。
 | 模型名 | source / transport | 实际路径 |
 |---|---|---|
 | 原有 `gemini-*` | `web` / `gemini-web-private-rpc` | 保留原 Gemini Web 实现和本地修复，模型身份属于未验证网页预设 |
-| `build-<model>[-low/medium/high]` | `build` / `google-gemini-public-api` | 在本服务端实现 Build ZIP 实际使用的公开 Gemini API，无第三方 WS |
-| `ais-<model>[-low/medium/high]` | `ais` / `google-gemini-public-api` | Playground 的公开 API 替代配置；没有连接网页 Playground |
+| `build-<model>[-low/medium/high]` | `build` / `google-gemini-public-api` 或 `aistudio-http` | 默认公开 API；可显式切到自托管 Build 会话通道 |
+| `ais-<model>[-low/medium/high]` | `ais` / `google-gemini-public-api` 或 `aistudio-http` | 默认公开 API；可显式切到自托管 Playground 会话通道 |
 | `ag-<upstream-model>` | `antigravity` / `sub2api-openai` | 用户自托管 Sub2API；API key 必须绑定 Antigravity 专属分组 |
 
-`build-`、`ais-` 是独立凭据/模型配置，**不是独立的网页额度池**。两者均使用
-`generativelanguage.googleapis.com`。不接入 Catiecli 固定 WS，也不获取、生成或
-转交 WAA proof。MakerSuite 私有 RPC/WAA Executor 没有启用。来源同时出现在
+默认公开 API 模式中的 `build-`、`ais-` 是独立凭据/模型配置，**不是独立的网页额度池**。
+可选 [纯 Go 会话模式](docs/aistudio-http.md) 复用固定版本的自托管 AIStudio2API，
+使用用户正常认证的账号，生成时无需浏览器；由后端处理私有协议及 WAA。
+Mixer 只持有独立服务密钥，通过补丁锁定每个请求的实际通道，不连接 Catiecli 固定 WS。
+私有协议兼容性、账号权益和额度仍由上游决定，启用配置不等于真实生成已经验证。来源同时出现在
 `/v1/models`、路由日志、`X-Mixer-Source` / `X-Mixer-Transport` 响应头和可用的
 JSON/SSE 元信息中；所有响应带 `X-Request-ID`。
 
@@ -48,6 +50,9 @@ curl http://127.0.0.1:8081/v1/quota/antigravity -H "Authorization: Bearer $MIXER
 原 Web 名称保持兼容；新前缀错误不会悄悄回落到 Web。
 
 ## 思考与能力
+
+下表针对默认公开 API 模式。纯 Go 会话模式使用独立的实测能力记录，未验证的
+low/medium/high、流式、图片和工具不开放，不照搬公开 API 的参数表。
 
 | 上游模型 | 档位 | 实际参数 |
 |---|---|---|

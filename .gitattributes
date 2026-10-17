@@ -1,0 +1,2 @@
+# Diff context prefixes are significant; preserve the audited patch byte format.
+sidecars/aistudio2api/mixer-routing.patch text eol=lf -whitespace

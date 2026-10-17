@@ -1,0 +1,728 @@
+diff --git a/internal/aistudio/auth.go b/internal/aistudio/auth.go
+index 205dcbb..6da3880 100644
+--- a/internal/aistudio/auth.go
++++ b/internal/aistudio/auth.go
+@@ -48,9 +48,10 @@ type StorageState struct {
+ 
+ // AuthSource 记录认证状态的来源
+ type AuthSource struct {
+-	Browser string `json:"browser"`
+-	Profile string `json:"profile,omitempty"`
+-	Email   string `json:"email,omitempty"`
++	Browser  string `json:"browser"`
++	Profile  string `json:"profile,omitempty"`
++	Email    string `json:"email,omitempty"`
++	AuthUser string `json:"auth_user,omitempty"`
+ }
+ 
+ // ChromeOAuthMaterial 保存 Chrome DBSC 续签材料
+@@ -73,6 +74,9 @@ func (s *StorageState) SetAuthExtension(extension AuthExtension) error {
+ 	if s == nil {
+ 		return fmt.Errorf("storage state 为空")
+ 	}
++	if _, err := normalizeAuthUser(extension.Source.AuthUser); err != nil {
++		return err
++	}
+ 	raw, err := json.Marshal(extension)
+ 	if err != nil {
+ 		return fmt.Errorf("编码认证扩展: %w", err)
+@@ -97,6 +101,56 @@ func (s StorageState) AuthExtension() (AuthExtension, bool, error) {
+ 	return extension, true, nil
+ }
+ 
++// AuthUser preserves the explicitly selected Google session in a multi-login cookie jar.
++// Legacy isolated-account states omit this field and retain session zero.
++func (s StorageState) AuthUser() (string, error) {
++	extension, _, err := s.AuthExtension()
++	if err != nil {
++		return "", err
++	}
++	return normalizeAuthUser(extension.Source.AuthUser)
++}
++
++func normalizeAuthUser(value string) (string, error) {
++	if value == "" {
++		return "0", nil
++	}
++	if len(value) > 10 || len(value) > 1 && value[0] == '0' {
++		return "", fmt.Errorf("storage state auth_user 必须为规范的非负十进制账号索引")
++	}
++	for _, character := range value {
++		if character < '0' || character > '9' {
++			return "", fmt.Errorf("storage state auth_user 必须为规范的非负十进制账号索引")
++		}
++	}
++	return value, nil
++}
++
++// aiStudioAccountPageURL pins navigation to the same account as the RPC headers.
++func aiStudioAccountPageURL(rawURL string, authUser string) (string, error) {
++	selected, err := normalizeAuthUser(authUser)
++	if err != nil {
++		return "", err
++	}
++	target, err := url.Parse(rawURL)
++	if err != nil || target.Scheme != "https" || target.Host != "aistudio.google.com" || target.User != nil {
++		return "", fmt.Errorf("AI Studio 账号页面必须位于官方 HTTPS origin")
++	}
++	query := target.Query()
++	if query.Has("authuser") && (len(query["authuser"]) != 1 || query.Get("authuser") != selected) {
++		return "", fmt.Errorf("AI Studio 页面尝试切换所选账号")
++	}
++	pathParts := strings.Split(strings.TrimPrefix(target.Path, "/"), "/")
++	if len(pathParts) >= 2 && pathParts[0] == "u" && pathParts[1] != selected {
++		return "", fmt.Errorf("AI Studio 页面尝试切换所选账号")
++	}
++	if selected != "0" || query.Has("authuser") {
++		query.Set("authuser", selected)
++	}
++	target.RawQuery = query.Encode()
++	return target.String(), nil
++}
++
+ // IsolatedLoginRequest 描述独立浏览器登录所需的稳定环境
+ type IsolatedLoginRequest struct {
+ 	AccountID string
+@@ -150,6 +204,9 @@ func WriteStorageState(filePath string, state StorageState) error {
+ 
+ // Validate 校验 storage state 的浏览器字段
+ func (s StorageState) Validate() error {
++	if _, err := s.AuthUser(); err != nil {
++		return err
++	}
+ 	for index, cookie := range s.Cookies {
+ 		if strings.TrimSpace(cookie.Name) == "" || strings.TrimSpace(cookie.Domain) == "" {
+ 			return fmt.Errorf("storage state Cookie %d 缺少名称或域", index)
+diff --git a/internal/aistudio/auth_user_test.go b/internal/aistudio/auth_user_test.go
+new file mode 100644
+index 0000000..68b1b29
+--- /dev/null
++++ b/internal/aistudio/auth_user_test.go
+@@ -0,0 +1,161 @@
++package aistudio
++
++import (
++	"context"
++	"encoding/json"
++	"io"
++	"net/http"
++	"net/url"
++	"path/filepath"
++	"strings"
++	"testing"
++	"time"
++)
++
++func selectedSessionFixture(t *testing.T, authUser string) StorageState {
++	t.Helper()
++	state := StorageState{}
++	for _, name := range []string{"SAPISID", "__Secure-1PAPISID", "__Secure-3PAPISID"} {
++		state.Cookies = append(state.Cookies, StateCookie{
++			Name: name, Value: "test-fixture", Domain: ".google.com", Path: "/", Expires: -1, Secure: true,
++		})
++	}
++	if err := state.SetAuthExtension(AuthExtension{Source: AuthSource{Browser: "mixer-import", AuthUser: authUser}}); err != nil {
++		t.Fatal(err)
++	}
++	return state
++}
++
++func TestStorageStateSelectedSession(t *testing.T) {
++	for _, raw := range []string{
++		`{"cookies":[],"origins":[]}`,
++		`{"cookies":[],"origins":[],"aistudio2api":{"source":{"browser":"camoufox"}}}`,
++	} {
++		var state StorageState
++		if err := json.Unmarshal([]byte(raw), &state); err != nil {
++			t.Fatal(err)
++		}
++		if got, err := state.AuthUser(); err != nil || got != "0" {
++			t.Fatalf("legacy selected session = %q, error %v", got, err)
++		}
++	}
++	state := selectedSessionFixture(t, "5")
++	raw, err := json.Marshal(state)
++	if err != nil {
++		t.Fatal(err)
++	}
++	var restored StorageState
++	if err := json.Unmarshal(raw, &restored); err != nil {
++		t.Fatal(err)
++	}
++	if got, err := restored.AuthUser(); err != nil || got != "5" {
++		t.Fatalf("persisted selected session = %q, error %v", got, err)
++	}
++	for _, value := range []string{"-1", "+5", " 5", "05", "5\r\nInjected: yes", "5&authuser=0", "５", "12345678901"} {
++		t.Run(value, func(t *testing.T) {
++			bad := StorageState{}
++			if err := bad.SetAuthExtension(AuthExtension{Source: AuthSource{AuthUser: value}}); err == nil {
++				t.Fatal("invalid selected session accepted")
++			}
++			encoded, _ := json.Marshal(AuthExtension{Source: AuthSource{AuthUser: value}})
++			bad.extra = map[string]json.RawMessage{authExtensionKey: encoded}
++			if err := bad.Validate(); err == nil {
++				t.Fatal("invalid persisted selected session accepted")
++			}
++		})
++	}
++}
++
++func TestSelectedSessionPageNavigation(t *testing.T) {
++	legacyURL := aiStudioOrigin + "/prompts/new_chat?model=gemini-test"
++	if got, err := aiStudioAccountPageURL(legacyURL, "0"); err != nil || got != legacyURL {
++		t.Fatalf("legacy navigation changed: %q, error %v", got, err)
++	}
++	for _, target := range []string{
++		aiStudioOrigin + "/prompts/new_chat?model=gemini-test&temporary=true",
++		aiStudioOrigin + "/u/5/prompts/new_chat?authuser=5",
++	} {
++		got, err := aiStudioAccountPageURL(target, "5")
++		if err != nil {
++			t.Fatal(err)
++		}
++		parsed, _ := url.Parse(got)
++		if parsed.Query().Get("authuser") != "5" {
++			t.Fatal("navigation lost selected account")
++		}
++	}
++	for _, target := range []string{
++		aiStudioOrigin + "/prompts/new_chat?authuser=0",
++		aiStudioOrigin + "/prompts/new_chat?authuser=5&authuser=0",
++		aiStudioOrigin + "/u/0/prompts/new_chat",
++		"https://example.com/?authuser=5",
++		"http://aistudio.google.com/?authuser=5",
++		"https://user@aistudio.google.com/?authuser=5",
++	} {
++		if _, err := aiStudioAccountPageURL(target, "5"); err == nil {
++			t.Fatalf("cross-account/origin navigation accepted: %s", target)
++		}
++	}
++}
++
++func TestSelectedSessionOverridesPublicAndRequestHeaders(t *testing.T) {
++	state := selectedSessionFixture(t, "5")
++	storagePath := filepath.Join(t.TempDir(), "storage-state.json")
++	if err := WriteStorageState(storagePath, state); err != nil {
++		t.Fatal(err)
++	}
++	account := &Account{ID: "fixture@example.com", Config: DefaultAccountConfig("fixture@example.com"), StoragePath: storagePath}
++	lease := &AccountLease{account: account, pool: NewAccountPool([]*Account{account}, 1)}
++	provider := ProtocolHeaderProviderFunc(func(context.Context, string) (http.Header, error) {
++		return http.Header{
++			"User-Agent": {"test-fixture"}, "X-Goog-Api-Key": {"test-public-key"},
++			"X-Goog-Authuser": {"0"}, "X-User-Agent": {"test-fixture"},
++		}, nil
++	})
++	for _, method := range []string{"ListModels", "GetLoggingContext", "GenerateContent", "ProxyStreamedCall", "ProxyUnaryCall"} {
++		t.Run(method, func(t *testing.T) {
++			rpc := RPCRequest{Method: method, URL: MakerSuiteRPCBase + method, Header: http.Header{"X-Goog-Authuser": {"9"}}}
++			_, headers, err := prepareProtocolHeaders(context.Background(), lease, rpc, NewSigner(), provider, time.Now(), true)
++			if err != nil {
++				t.Fatal(err)
++			}
++			if headers.Get("X-Goog-Authuser") != "5" {
++				t.Fatal("request used a different account")
++			}
++		})
++	}
++	runtime := &goWAARuntime{storage: state, authUser: "5"}
++	headers, err := runtime.rpcHeaders("test-public-key")
++	if err != nil || headers.Get("X-Goog-Authuser") != "5" {
++		t.Fatalf("bootstrap selected session = %q, error %v", headers.Get("X-Goog-Authuser"), err)
++	}
++}
++
++type selectedSessionRoundTripper func(*http.Request) (*http.Response, error)
++
++func (transport selectedSessionRoundTripper) RoundTrip(request *http.Request) (*http.Response, error) {
++	return transport(request)
++}
++
++func TestSelectedSessionProtectedSend(t *testing.T) {
++	state := selectedSessionFixture(t, "5")
++	requests := 0
++	runtime := &goWAARuntime{
++		storage: state, authUser: "5",
++		client: &http.Client{Transport: selectedSessionRoundTripper(func(request *http.Request) (*http.Response, error) {
++			requests++
++			if request.Header.Get("X-Goog-Authuser") != "5" {
++				t.Fatal("protected transport switched account")
++			}
++			return &http.Response{StatusCode: 200, Header: http.Header{}, Body: io.NopCloser(strings.NewReader("[]"))}, nil
++		})},
++	}
++	response, err := runtime.SendProtected(context.Background(), MakerSuiteRPCBase+"ProxyStreamedCall", http.Header{"X-Goog-Authuser": {"0"}}, []byte("[]"))
++	if err != nil {
++		t.Fatal(err)
++	}
++	response.Body.Close()
++	if requests != 1 {
++		t.Fatalf("request count = %d", requests)
++	}
++}
+diff --git a/internal/aistudio/generate.go b/internal/aistudio/generate.go
+index 66fd1d2..4be44df 100644
+--- a/internal/aistudio/generate.go
++++ b/internal/aistudio/generate.go
+@@ -664,6 +664,9 @@ func validateGenerateEntry(request GenerateRequest, entry modelEntry) error {
+ }
+ 
+ func (c *Client) Generate(ctx context.Context, request GenerateRequest) (<-chan Event, error) {
++	if err := VerifyMixerLease(ctx); err != nil {
++		return nil, err
++	}
+ 	lease, leased := AccountLeaseFromContext(ctx)
+ 	build := leased && lease.Channel() == ChannelBuild
+ 	var entry modelEntry
+diff --git a/internal/aistudio/mixer_channel.go b/internal/aistudio/mixer_channel.go
+new file mode 100644
+index 0000000..db2aac4
+--- /dev/null
++++ b/internal/aistudio/mixer_channel.go
+@@ -0,0 +1,51 @@
++package aistudio
++
++import (
++	"context"
++	"fmt"
++)
++
++type mixerChannelKey struct{}
++
++// ContextWithMixerChannel pins ordinary generation to an authenticated caller's
++// channel. It changes routing only; account eligibility and quotas still apply.
++func ContextWithMixerChannel(ctx context.Context, channel Channel) context.Context {
++	return context.WithValue(ctx, mixerChannelKey{}, channel)
++}
++
++func MixerChannelFromContext(ctx context.Context) Channel {
++	channel, _ := ctx.Value(mixerChannelKey{}).(Channel)
++	return channel
++}
++
++// LockMixerSelection is applied again on every scheduling attempt, including
++// account retries. Unsupported Build-only inputs fail instead of changing source.
++func LockMixerSelection(ctx context.Context, selection AccountSelection) (AccountSelection, error) {
++	channel := MixerChannelFromContext(ctx)
++	if channel == "" {
++		return selection, nil
++	}
++	if channel != ChannelPlayground && channel != ChannelBuild {
++		return selection, fmt.Errorf("%w: invalid locked upstream channel", ErrInvalidArgument)
++	}
++	if selection.Method != "generateContent" || channel == ChannelBuild && !generationChannelSelection(selection) {
++		return selection, fmt.Errorf("%w: request cannot use the locked upstream channel", ErrInvalidArgument)
++	}
++	selection.Channel = channel
++	selection.PreferredChannel = ""
++	return selection, nil
++}
++
++// VerifyMixerLease is the final guard immediately before a generation transport
++// is selected. A missing or mismatching lease must never fall back to Playground.
++func VerifyMixerLease(ctx context.Context) error {
++	channel := MixerChannelFromContext(ctx)
++	if channel == "" {
++		return nil
++	}
++	lease, ok := AccountLeaseFromContext(ctx)
++	if !ok || lease.Channel() != channel {
++		return fmt.Errorf("%w: upstream channel lock was not satisfied", ErrInvalidArgument)
++	}
++	return nil
++}
+diff --git a/internal/aistudio/mixer_channel_test.go b/internal/aistudio/mixer_channel_test.go
+new file mode 100644
+index 0000000..5521d79
+--- /dev/null
++++ b/internal/aistudio/mixer_channel_test.go
+@@ -0,0 +1,81 @@
++package aistudio
++
++import (
++	"context"
++	"errors"
++	"testing"
++	"time"
++)
++
++func TestMixerChannelDoesNotFallbackDuringQuotaCooldown(t *testing.T) {
++	model := Model{ID: "gemini", Methods: []string{"generateContent"}, Capabilities: map[string]bool{"chat_model": true}}
++	account := &Account{ID: "fixture", Config: AccountConfig{Enabled: true}, State: AccountReady, Models: []Model{model}, modelAccessGeneration: 1}
++	pool := NewAccountPool([]*Account{account}, 1)
++	pool.SetUpstreamChannels([]Channel{ChannelPlayground, ChannelBuild})
++	if err := pool.SetBuildCatalog(account.ID, []Model{model}); err != nil {
++		t.Fatal(err)
++	}
++	ctx := ContextWithMixerChannel(context.Background(), ChannelBuild)
++	selection, err := LockMixerSelection(ctx, AccountSelection{ModelID: model.ID, Method: "generateContent", PreferredChannel: ChannelPlayground})
++	if err != nil {
++		t.Fatal(err)
++	}
++	lease, _, err := pool.TryAcquireFor(ctx, selection)
++	if err != nil || lease == nil || lease.Channel() != ChannelBuild {
++		t.Fatalf("lease=%v err=%v", lease, err)
++	}
++	if err := VerifyMixerLease(ContextWithAccountLease(ctx, lease)); err != nil {
++		t.Fatal(err)
++	}
++	if err := lease.Release(); err != nil {
++		t.Fatal(err)
++	}
++	if err := pool.MarkCooldownIfGeneration(account.ID, ChannelCooldownScope(ChannelBuild, model.ID), 1, time.Now(), time.Now().Add(time.Hour), "fixture quota"); err != nil {
++		t.Fatal(err)
++	}
++	lease, _, err = pool.TryAcquireFor(ctx, selection)
++	if lease != nil {
++		_ = lease.Release()
++		t.Fatal("locked Build fell back during quota cooldown")
++	}
++	if err != nil {
++		t.Fatal(err)
++	}
++	groups, err := pool.ClassifyCandidates(ctx, selection, []string{account.ID})
++	if err != nil || !groups.Eligible || groups.EarliestCooldown.IsZero() || len(groups.WarmReady)+len(groups.WarmAvailable)+len(groups.StandbyReady) != 0 {
++		t.Fatalf("quota cooldown was not preserved: %+v err=%v", groups, err)
++	}
++	if pool.AccountChannelAvailable(account.ID, selection) {
++		t.Fatal("alternate channel bypassed lock")
++	}
++	plain, _, err := pool.TryAcquireFor(context.Background(), AccountSelection{ModelID: model.ID, Method: "generateContent"})
++	if err != nil || plain == nil || plain.Channel() != ChannelPlayground {
++		t.Fatalf("unlocked Playground should remain available: %v", err)
++	}
++	defer plain.Release()
++	if VerifyMixerLease(ContextWithAccountLease(ctx, plain)) == nil {
++		t.Fatal("mismatching transport lease accepted")
++	}
++}
++
++func TestMixerChannelRejectsIncompatibleBuildInputs(t *testing.T) {
++	ctx := ContextWithMixerChannel(context.Background(), ChannelBuild)
++	for _, selection := range []AccountSelection{
++		{ModelID: "gemini", Method: "generateContent", ResourceID: "drive-file"},
++		{ModelID: "gemini", Method: "generateContent", PlaygroundOnly: true},
++		{ModelID: "gemini", Method: "countTokens"},
++	} {
++		if _, err := LockMixerSelection(ctx, selection); !errors.Is(err, ErrInvalidArgument) {
++			t.Fatalf("selection=%+v err=%v", selection, err)
++		}
++	}
++	if VerifyMixerLease(ctx) == nil {
++		t.Fatal("missing transport lease accepted")
++	}
++	pool := NewAccountPool(nil, 1)
++	pool.SetUpstreamChannels([]Channel{ChannelPlayground})
++	selection, _ := LockMixerSelection(ctx, AccountSelection{ModelID: "gemini", Method: "generateContent"})
++	if len(pool.selectionChannelsLocked(selection)) != 0 {
++		t.Fatal("disabled Build silently switched source")
++	}
++}
+diff --git a/internal/aistudio/runtime_go.go b/internal/aistudio/runtime_go.go
+index 06b0a5d..638dc18 100644
+--- a/internal/aistudio/runtime_go.go
++++ b/internal/aistudio/runtime_go.go
+@@ -52,6 +52,7 @@ type goWAARuntime struct {
+ 	userAgent      string
+ 	acceptLanguage string
+ 	pageURL        string
++	authUser       string
+ 	headers        http.Header
+ 	cacheDirectory string
+ 
+@@ -113,6 +114,10 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
+ 	if err != nil {
+ 		return nil, err
+ 	}
++	authUser, err := storage.AuthUser()
++	if err != nil {
++		return nil, err
++	}
+ 	fingerprint, err := camoufoxnative.AccountFingerprint(options)
+ 	if err != nil {
+ 		return nil, err
+@@ -121,12 +126,16 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
+ 	if err != nil {
+ 		return nil, err
+ 	}
+-	runtime := &goWAARuntime{options: options, client: client, storage: storage}
++	runtime := &goWAARuntime{options: options, client: client, storage: storage, authUser: authUser}
+ 	runtime.profile, runtime.userAgent, runtime.acceptLanguage = profileFromFingerprint(fingerprint)
+ 	runtime.pageURL = aiStudioOrigin + "/prompts/new_chat?model=" + url.QueryEscape(options.Model)
+ 	if options.TemporaryChat {
+ 		runtime.pageURL += "&temporary=true"
+ 	}
++	runtime.pageURL, err = aiStudioAccountPageURL(runtime.pageURL, authUser)
++	if err != nil {
++		return nil, err
++	}
+ 	runtime.profile.PageURL = runtime.pageURL
+ 	runtime.profile.HasFocus = true
+ 	runtime.profile.Locale, _ = fingerprint["navigator.language"].(string)
+@@ -157,7 +166,7 @@ func newGoWAARuntime(ctx context.Context, options camoufoxnative.Options) (*goWA
+ 	runtime.headers = http.Header{}
+ 	runtime.headers.Set("user-agent", runtime.userAgent)
+ 	runtime.headers.Set("x-goog-api-key", apiKey)
+-	runtime.headers.Set("x-goog-authuser", "0")
++	runtime.headers.Set("x-goog-authuser", authUser)
+ 	runtime.headers.Set("x-user-agent", "grpc-web-javascript/0.1")
+ 	runtime.headers.Set("x-aistudio-visit-id", visitID)
+ 	if extension != "" {
+@@ -340,7 +349,10 @@ func (runtime *goWAARuntime) loadPage(ctx context.Context) (string, error) {
+ 			if location.Hostname() == "accounts.google.com" {
+ 				return "", fmt.Errorf("%w url=%s", camoufoxnative.ErrAuthenticationRequired, location.String())
+ 			}
+-			target = location.String()
++			target, err = aiStudioAccountPageURL(location.String(), runtime.authUser)
++			if err != nil {
++				return "", err
++			}
+ 			continue
+ 		}
+ 		if response.StatusCode != http.StatusOK {
+@@ -366,7 +378,11 @@ func (runtime *goWAARuntime) rpcHeaders(apiKey string) (http.Header, error) {
+ 	headers.Set("Referer", aiStudioOrigin+"/")
+ 	headers.Set("Content-Type", "application/json+protobuf")
+ 	headers.Set("X-Goog-Api-Key", apiKey)
+-	headers.Set("X-Goog-AuthUser", "0")
++	authUser, err := runtime.cookies().AuthUser()
++	if err != nil {
++		return nil, err
++	}
++	headers.Set("X-Goog-AuthUser", authUser)
+ 	headers.Set("X-User-Agent", "grpc-web-javascript/0.1")
+ 	headers.Set("Authorization", authorization)
+ 	headers.Set("Origin", aiStudioOrigin)
+@@ -631,6 +647,11 @@ func (runtime *goWAARuntime) ProtocolHeaders(ctx context.Context) (http.Header,
+ // SendProtected 以官网页面 fetch 的 Firefox 请求形状流式发送受保护请求
+ func (runtime *goWAARuntime) SendProtected(ctx context.Context, rawURL string, headers http.Header, body []byte) (*camoufoxnative.ProtectedResponse, error) {
+ 	request := headers.Clone()
++	authUser, err := runtime.cookies().AuthUser()
++	if err != nil {
++		return nil, err
++	}
++	request.Set("X-Goog-Authuser", authUser)
+ 	request.Set("Accept", "*/*")
+ 	request.Set("Referer", aiStudioOrigin+"/")
+ 	request.Set("Origin", aiStudioOrigin)
+diff --git a/internal/aistudio/service.go b/internal/aistudio/service.go
+index dd32af7..37800e2 100644
+--- a/internal/aistudio/service.go
++++ b/internal/aistudio/service.go
+@@ -654,6 +654,10 @@ func (s *PooledService) Generate(ctx context.Context, request GenerateRequest) (
+ 	if RequestNeedsBuildSchema(request) || request.Unary && s.BuildNativeNonstream {
+ 		selection.PreferredChannel = ChannelBuild
+ 	}
++	selection, err = LockMixerSelection(ctx, selection)
++	if err != nil {
++		return nil, err
++	}
+ 	pinned := selection.AccountID != "" || selection.ResourceID != ""
+ 	if _, ok := AccountLeaseFromContext(ctx); ok {
+ 		pinned = true
+diff --git a/internal/aistudio/transport_http.go b/internal/aistudio/transport_http.go
+index 333779f..5a120aa 100644
+--- a/internal/aistudio/transport_http.go
++++ b/internal/aistudio/transport_http.go
+@@ -267,6 +267,12 @@ func prepareProtocolHeaders(
+ 			headers.Add(name, value)
+ 		}
+ 	}
++	// Account selection is trusted local state, never a client or discovered header.
++	authUser, err := state.AuthUser()
++	if err != nil {
++		return StorageState{}, nil, err
++	}
++	headers.Set("X-Goog-Authuser", authUser)
+ 	for _, name := range []string{"User-Agent", "X-Goog-Api-Key", "X-Goog-Authuser", "X-User-Agent"} {
+ 		if strings.TrimSpace(headers.Get(name)) == "" {
+ 			return StorageState{}, nil, fmt.Errorf("账户动态公共头缺少 %s", name)
+diff --git a/internal/api/mixer_channel.go b/internal/api/mixer_channel.go
+new file mode 100644
+index 0000000..82923d7
+--- /dev/null
++++ b/internal/api/mixer_channel.go
+@@ -0,0 +1,59 @@
++package api
++
++import (
++	"net/http"
++	"strings"
++
++	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
++)
++
++const mixerChannelHeader = "X-Mixer-Upstream-Channel"
++
++// mixerChannelMiddleware runs AFTER API-key authentication. The response headers
++// acknowledge an enforced routing constraint, including on upstream errors; they
++// do not claim that an unsuccessful request reached Google.
++func mixerChannelMiddleware(configuredKeys string, next http.Handler) http.Handler {
++	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++		values, present := r.Header[http.CanonicalHeaderKey(mixerChannelHeader)]
++		if !present {
++			next.ServeHTTP(w, r)
++			return
++		}
++		hasKey := false
++		keys := strings.Split(configuredKeys, ",")
++		for index, key := range keys {
++			keys[index] = strings.TrimSpace(key)
++			hasKey = hasKey || keys[index] != ""
++		}
++		if !hasKey || !checkAPIKeyMatches(r, keys) {
++			writeAuthError(w, r)
++			return
++		}
++		if len(values) != 1 || values[0] != "playground" && values[0] != "build" {
++			writeOpenAIError(w, http.StatusBadRequest, "invalid_upstream_channel", "Expected exactly one playground or build channel")
++			return
++		}
++		channel := aistudio.Channel(values[0])
++		w.Header().Set(mixerChannelHeader, string(channel))
++		w.Header().Set("X-Mixer-Channel-Locked", "1")
++		if !mixerChannelRoute(r) {
++			writeOpenAIError(w, http.StatusBadRequest, "unsupported_channel_route", "Channel locking is supported only for model discovery and ordinary generation")
++			return
++		}
++		next.ServeHTTP(w, r.WithContext(aistudio.ContextWithMixerChannel(r.Context(), channel)))
++	})
++}
++
++func mixerChannelRoute(r *http.Request) bool {
++	if r.Method == http.MethodGet {
++		return r.URL.Path == "/v1/models" || r.URL.Path == "/v1beta/models"
++	}
++	if r.Method != http.MethodPost {
++		return false
++	}
++	if r.URL.Path == "/v1/chat/completions" || r.URL.Path == "/v1/responses" {
++		return true
++	}
++	return strings.HasPrefix(r.URL.Path, "/v1beta/models/") &&
++		(strings.HasSuffix(r.URL.Path, ":generateContent") || strings.HasSuffix(r.URL.Path, ":streamGenerateContent"))
++}
+diff --git a/internal/api/mixer_channel_test.go b/internal/api/mixer_channel_test.go
+new file mode 100644
+index 0000000..a05c67b
+--- /dev/null
++++ b/internal/api/mixer_channel_test.go
+@@ -0,0 +1,60 @@
++package api
++
++import (
++	"net/http"
++	"net/http/httptest"
++	"testing"
++
++	"github.com/Mag1cFall/AIStudio2API/internal/aistudio"
++)
++
++func TestMixerChannelAuthenticationAndScope(t *testing.T) {
++	for _, test := range []struct {
++		name, key, credential, path string
++		values                      []string
++		status                      int
++		called                      bool
++	}{
++		{"build", " secret ", "secret", "/v1/chat/completions", []string{"build"}, 429, true},
++		{"playground native", "secret", "secret", "/v1beta/models/gemini:streamGenerateContent", []string{"playground"}, 429, true},
++		{"unauthenticated", "secret", "bad", "/v1/chat/completions", []string{"build"}, 401, false},
++		{"empty key denied", "", "", "/v1/chat/completions", []string{"build"}, 401, false},
++		{"duplicate", "secret", "secret", "/v1/chat/completions", []string{"build", "playground"}, 400, false},
++		{"malformed", "secret", "secret", "/v1/chat/completions", []string{"build,playground"}, 400, false},
++		{"unsupported route", "secret", "secret", "/v1/images/generations", []string{"build"}, 400, false},
++		{"missing header preserves behavior", "secret", "secret", "/v1/chat/completions", nil, 429, true},
++	} {
++		t.Run(test.name, func(t *testing.T) {
++			called := false
++			handler := authMiddleware(test.key, mixerChannelMiddleware(test.key, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
++				called = true
++				want := ""
++				if len(test.values) == 1 {
++					want = test.values[0]
++				}
++				if got := string(aistudio.MixerChannelFromContext(r.Context())); got != want {
++					t.Errorf("channel=%q want=%q", got, want)
++				}
++				w.WriteHeader(429)
++			})))
++			r := httptest.NewRequest(http.MethodPost, test.path, nil)
++			r.Header.Set("Authorization", "Bearer "+test.credential)
++			if test.values != nil {
++				r.Header[http.CanonicalHeaderKey(mixerChannelHeader)] = test.values
++			}
++			w := httptest.NewRecorder()
++			handler.ServeHTTP(w, r)
++			if w.Code != test.status || called != test.called {
++				t.Fatalf("status=%d called=%v", w.Code, called)
++			}
++			if test.called && len(test.values) == 1 {
++				if w.Header().Get(mixerChannelHeader) != test.values[0] || w.Header().Get("X-Mixer-Channel-Locked") != "1" {
++					t.Fatal("missing lock acknowledgment on upstream error")
++				}
++			}
++			if w.Code == 401 && w.Header().Get("X-Mixer-Channel-Locked") != "" {
++				t.Fatal("unauthenticated lock acknowledgment")
++			}
++		})
++	}
++}
+diff --git a/internal/api/router.go b/internal/api/router.go
+index 1fbd4e2..8881de2 100644
+--- a/internal/api/router.go
++++ b/internal/api/router.go
+@@ -99,7 +99,7 @@ func NewHandler(service aistudio.Service, config Config) http.Handler {
+ 
+ 	root := http.NewServeMux()
+ 	root.Handle("GET /health", corsMiddleware(http.HandlerFunc(s.handleHealth)))
+-	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, public))))
++	publicHandler := bodyLimitMiddleware(browserOriginMiddleware(config.APIKey, authMiddleware(config.APIKey, mixerChannelMiddleware(config.APIKey, requestBodyMiddleware(config.Ledger, public)))))
+ 	loggedHandler := requestLoggingMiddleware(config.Admin, corsMiddleware(publicHandler))
+ 	root.Handle("/v1/", loggedHandler)
+ 	root.Handle("/v1beta/", loggedHandler)
+diff --git a/internal/app/runtime.go b/internal/app/runtime.go
+index 6dcab64..ea84be2 100644
+--- a/internal/app/runtime.go
++++ b/internal/app/runtime.go
+@@ -2988,6 +2988,11 @@ func (closer *trackedMediaReadCloser) Close() error {
+ }
+ 
+ func (service *trackedService) acquireWarmLease(ctx context.Context, selection aistudio.AccountSelection) (*aistudio.AccountLease, error) {
++	var lockErr error
++	selection, lockErr = aistudio.LockMixerSelection(ctx, selection)
++	if lockErr != nil {
++		return nil, lockErr
++	}
+ 	fixedAccount := strings.TrimSpace(selection.AccountID) != "" || strings.TrimSpace(selection.ResourceID) != ""
+ 	failedWorkers := make(map[string]struct{})
+ 	var promoteFailure error
+@@ -3393,6 +3398,10 @@ func (service *trackedService) generateWithRetry(
+ 			selection.PreferredChannel = ""
+ 			fallbackReason = "Build 拒绝请求参数"
+ 		}
++		selection, err = aistudio.LockMixerSelection(requestCtx, selection)
++		if err != nil {
++			break
++		}
+ 		if (unbound || fileBound) && len(attempted) > 0 {
+ 			enabled, _ := service.pool.EnabledAccounts()
+ 			for _, accountID := range enabled {
+@@ -3403,7 +3412,7 @@ func (service *trackedService) generateWithRetry(
+ 		}
+ 		nextLease, acquireErr := service.acquireWarmLease(requestCtx, selection)
+ 		var buildCooling *aistudio.AllCoolingError
+-		if acquireErr != nil && selection.Channel == aistudio.ChannelBuild && requestCtx.Err() == nil &&
++		if acquireErr != nil && aistudio.MixerChannelFromContext(requestCtx) == "" && selection.Channel == aistudio.ChannelBuild && requestCtx.Err() == nil &&
+ 			(errors.Is(acquireErr, aistudio.ErrNoEligibleAccount) || errors.As(acquireErr, &buildCooling)) {
+ 			// 没有账户能经 Build 服务时，结构化输出 Schema 改用 Playground 载体
+ 			selection.Channel = ""
+@@ -3617,7 +3626,7 @@ func (service *trackedService) generateWithRetry(
+ 			}
+ 		}
+ 		var rpcErr *aistudio.RPCError
+-		if lease.Channel() == aistudio.ChannelBuild && service.pool.PlaygroundEnabled() && requestCtx.Err() == nil &&
++		if aistudio.MixerChannelFromContext(requestCtx) == "" && lease.Channel() == aistudio.ChannelBuild && service.pool.PlaygroundEnabled() && requestCtx.Err() == nil &&
+ 			errors.As(err, &rpcErr) && rpcErr.StatusCode == http.StatusBadRequest && rpcErr.Code == 3 {
+ 			buildRejection = &rejectedBuildAttempt{
+ 				accountID: request.AccountID, generation: lease.ModelAccessGeneration(), checkedAt: lease.CheckedAt(), err: err,

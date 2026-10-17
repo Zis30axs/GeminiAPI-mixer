@@ -17,5 +17,15 @@ jobs:
           python-version: '3.12'
       - run: python -m pip install -r requirements.txt
       - run: python -m unittest discover -s tests -q
-      - run: node --test tests/test_cookie_extension.cjs tests/test_quota_dashboard.cjs
+      - run: node --test tests/test_cookie_extension.cjs tests/test_quota_dashboard.cjs tests/test_aistudio_session_extension.cjs
       - run: docker build -t geminiapi-mixer:ci .
+  aistudio-sidecar:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262
+        with:
+          persist-credentials: false
+      # The pinned build runs the affected Go tests without network access.
+      - run: docker build -t geminiapi-mixer-aistudio:ci sidecars/aistudio2api
+      - run: docker run --rm --network none --read-only --cap-drop ALL --security-opt no-new-privileges geminiapi-mixer-aistudio:ci -h
