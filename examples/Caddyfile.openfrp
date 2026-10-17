@@ -1,0 +1,33 @@
+# Example for an existing OpenFRP TCP entrance forwarding to this host's :8080.
+# Keep the root fallback pointed at the existing Sub2API deployment.
+{
+	admin 127.0.0.1:20191
+	auto_https off
+	persist_config off
+}
+
+http://:8080 {
+	bind 0.0.0.0
+
+	redir /gemini /gemini/ 308
+
+	handle_path /gemini/* {
+		reverse_proxy 127.0.0.1:18083 {
+			flush_interval -1
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 600s
+			}
+		}
+	}
+
+	handle {
+		reverse_proxy 127.0.0.1:18081 {
+			flush_interval -1
+			transport http {
+				dial_timeout 5s
+				response_header_timeout 600s
+			}
+		}
+	}
+}

@@ -84,6 +84,20 @@ class MixerHTTPTests(unittest.TestCase):
         self.assertNotIn("synthetic+mixer/key", body)
         self.assertEqual(self.call("/v1/quota/antigravity", auth=False)[0], 401)
 
+    def test_dashboard_trusted_http_origin_comes_from_operator_config_only(self):
+        with mock.patch.dict(os.environ, {"MIXER_DASHBOARD_HTTP_ORIGINS": ""}):
+            status, default_headers, default_body = self.call("/quota", auth=False, headers={
+                "Host": "untrusted.example:60000", "X-Forwarded-Host": "untrusted.example:60000",
+            })
+        self.assertEqual(status, 200)
+        self.assertNotIn("untrusted.example", default_body)
+        with mock.patch.dict(os.environ, {"MIXER_DASHBOARD_HTTP_ORIGINS": "http://gateway.example:60000"}):
+            status, configured_headers, configured_body = self.call("/quota", auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn("http://gateway.example:60000", configured_body)
+        self.assertNotEqual(default_headers["Content-Security-Policy"], configured_headers["Content-Security-Policy"])
+        self.assertNotIn("synthetic+mixer/key", configured_body)
+
     def test_all_inference_routes_require_authentication(self):
         for path in ("/v1/chat/completions", "/v1/responses", "/v1beta/models/build-test:generateContent"):
             with self.subTest(path=path):

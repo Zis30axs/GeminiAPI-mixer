@@ -1,11 +1,17 @@
 """Public static shell; quota data requires a manually entered Mixer key."""
 
+import ipaddress
+import json
+import os
+import re
 from base64 import b64encode
+from collections.abc import Mapping
 from hashlib import sha256
+from urllib.parse import urlsplit
 
-__all__ = ["HTML_PAGE", "CONTENT_SECURITY_POLICY"]
+__all__ = ["HTML_PAGE", "CONTENT_SECURITY_POLICY", "render_dashboard"]
 
-HTML_PAGE = r'''<!doctype html>
+_HTML_TEMPLATE = r'''<!doctype html>
 <html lang="zh-CN">
 <head>
 <meta charset="utf-8">
@@ -33,7 +39,7 @@ main{max-width:1500px;margin:auto;padding:32px 24px 56px}h1{font-size:29px;line-
 <button id="connect" class="primary" type="submit">连接并刷新</button>
 <button id="disconnect" type="button" disabled>清除密钥</button>
 </form>
-<p id="key-note" class="muted note">密钥仅保存在本页内存，提交后输入框会清空；刷新或关闭页面即忘记。请使用 HTTPS 或本机地址。</p>
+<p id="key-note" class="muted note">密钥仅保存在本页内存，提交后输入框会清空；刷新或关闭页面即忘记。HTTPS 可用；HTTP 不加密，仅本机地址或操作员明确配置的信任源可用。</p>
 <div class="controls"><button id="refresh" type="button" disabled>立即刷新</button><label><input id="auto-refresh" type="checkbox" checked>每 60 秒刷新</label><span id="received-at" class="muted note">尚未读取数据</span></div>
 <div id="status" class="status" role="status" aria-live="polite">输入密钥后连接。此页面不发起推理请求。</div>
 </section>
@@ -54,7 +60,8 @@ main{max-width:1500px;margin:auto;padding:32px 24px 56px}h1{font-size:29px;line-
 <script>
 (() => {
   "use strict";
-  const ENDPOINT = "/v1/quota/antigravity";
+  const ENDPOINT = "./v1/quota/antigravity";
+  const TRUSTED_HTTP_ORIGINS = Object.freeze(__MIXER_DASHBOARD_HTTP_ORIGINS__);
   const MAX_BYTES = 2 * 1024 * 1024;
   const byId = (id) => document.getElementById(id);
   let mixerKey = "";
@@ -64,6 +71,14 @@ main{max-width:1500px;margin:auto;padding:32px 24px 56px}h1{font-size:29px;line-
   let authVersion = 0;
   let hasData = false;
 
+  function trustedContext() {
+    if (window.top !== window.self) return false;
+    if (location.protocol === "https:") return true;
+    return location.protocol === "http:" && (["localhost", "127.0.0.1", "[::1]"].includes(location.hostname) || TRUSTED_HTTP_ORIGINS.includes(location.origin));
+  }
+  function contextFailure() {
+    return window.top !== window.self ? "请直接打开看板，嵌入页面不能发送密钥。" : "当前来源未获允许。请使用 HTTPS、本机地址或操作员明确配置的 HTTP 信任源；HTTP 不加密。";
+  }
   const asObject = (value) => value && typeof value === "object" && !Array.isArray(value) ? value : {};
   const safeText = (value, fallback = "未确认") => typeof value === "string" && value.trim() ? value.slice(0, 500) : fallback;
   const finiteNumber = (value) => typeof value === "number" && Number.isFinite(value);
@@ -172,8 +187,10 @@ main{max-width:1500px;margin:auto;padding:32px 24px 56px}h1{font-size:29px;line-
     }
   }
   function buttons() {
-    byId("connect").disabled = busy;
-    byId("refresh").disabled = busy || !mixerKey;
+    const trusted = trustedContext();
+    byId("mixer-key").disabled = !trusted;
+    byId("connect").disabled = busy || !trusted;
+    byId("refresh").disabled = busy || !mixerKey || !trusted;
     byId("disconnect").disabled = !mixerKey;
   }
   function schedule() {
@@ -206,6 +223,7 @@ main{max-width:1500px;margin:auto;padding:32px 24px 56px}h1{font-size:29px;line-
   }
   async function refresh() {
     if (busy || !mixerKey) return;
+    if (!trustedContext()) { status(contextFailure(), "error"); return; }
     busy = true;
     buttons();
     const version = authVersion;
@@ -245,7 +263,7 @@ main{max-width:1500px;margin:auto;padding:32px 24px 56px}h1{font-size:29px;line-
     const candidate = byId("mixer-key").value.trim();
     byId("mixer-key").value = "";
     if (!candidate || candidate.length > 4096 || /[\x00-\x20\x7f]/.test(candidate)) { status("请输入有效的 Mixer Key。", "error"); return; }
-    if (location.protocol !== "https:" && !(location.protocol === "http:" && ["localhost", "127.0.0.1", "[::1]"].includes(location.hostname))) { status("请通过 HTTPS 或本机地址打开页面后再输入密钥。", "error"); return; }
+    if (!trustedContext()) { status(contextFailure(), "error"); return; }
     mixerKey = candidate;
     authVersion += 1;
     schedule();
@@ -273,18 +291,95 @@ main{max-width:1500px;margin:auto;padding:32px 24px 56px}h1{font-size:29px;line-
     if (activeController) activeController.abort();
     if (refreshTimer !== null) clearInterval(refreshTimer);
   });
+  buttons();
+  if (!trustedContext()) status(contextFailure(), "error");
 })();
 </script>
 </body>
 </html>
 '''
 
-# Hash the exact UTF-8 script text, including its surrounding newlines. Serve
-# this as an HTTP header: frame-ancestors is not enforced by CSP meta elements.
-_SCRIPT_TEXT = HTML_PAGE.partition("<script>")[2].partition("</script>")[0]
-_SCRIPT_HASH = b64encode(sha256(_SCRIPT_TEXT.encode("utf-8")).digest()).decode("ascii")
-CONTENT_SECURITY_POLICY = (
-    "default-src 'none'; script-src 'sha256-" + _SCRIPT_HASH
-    + "'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; "
-    "form-action 'none'; frame-ancestors 'none'"
-)
+def _http_origin(value: str) -> str | None:
+    """Accept an ASCII HTTP origin, without browser-dependent URL shortcuts."""
+    if not value or len(value) > 512 or not value.isascii():
+        return None
+    if any(character in value for character in "?#@\\"):
+        return None
+    try:
+        parsed = urlsplit(value)
+        if (parsed.scheme != "http" or not parsed.netloc or parsed.path
+                or parsed.query or parsed.fragment or parsed.username is not None
+                or parsed.password is not None):
+            return None
+        authority = parsed.netloc
+        if authority.startswith("["):
+            match = re.fullmatch(r"\[([0-9A-Fa-f:.]+)\](?::([0-9]{1,5}))?", authority)
+            if match is None:
+                return None
+            host = "[" + ipaddress.IPv6Address(match[1]).compressed + "]"
+        else:
+            match = re.fullmatch(r"([A-Za-z0-9.-]+)(?::([0-9]{1,5}))?", authority)
+            if match is None:
+                return None
+            host = match[1].lower()
+            if len(host) > 253 or any(not re.fullmatch(r"[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?", part) for part in host.split(".")):
+                return None
+            # WHATWG URLs normalize numeric host shortcuts differently from
+            # Python. Accept only unambiguous dotted-decimal IPv4 addresses.
+            if re.fullmatch(r"(?:[0-9]+|0x[0-9a-f]+)", host.rsplit(".", 1)[-1]):
+                host = str(ipaddress.IPv4Address(host))
+        port = int(match[2]) if match[2] is not None else 80
+        if not 1 <= port <= 65535:
+            return None
+        return "http://" + host + (":" + str(port) if port != 80 else "")
+    except (ValueError, TypeError, OverflowError):
+        return None
+
+
+def _http_origins(value: object) -> list[str]:
+    """Malformed operator configuration fails closed, without partial grants."""
+    if not isinstance(value, str) or len(value) > 8192:
+        return []
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        return []
+    if not value.strip(" "):
+        return []
+    parts = value.split(",")
+    if len(parts) > 16:
+        return []
+    result = []
+    for part in parts:
+        origin = _http_origin(part.strip(" "))
+        if origin is None:
+            return []
+        if origin not in result:
+            result.append(origin)
+    return result
+
+
+def render_dashboard(environ: Mapping[str, str] | None = None) -> tuple[str, str]:
+    """Render trusted operator origins, never request Host or forwarded headers.
+
+    HTTP remains unencrypted. This narrow opt-in only enables exact origin
+    matches in the browser; quota data retains its regular Bearer authentication.
+    Return the matching CSP for use as an HTTP response header.
+    """
+    configured = os.environ if environ is None else environ
+    origins = _http_origins(configured.get("MIXER_DASHBOARD_HTTP_ORIGINS", ""))
+    encoded = json.dumps(origins, ensure_ascii=True, separators=(",", ":"))
+    encoded = encoded.replace("<", "\\u003c").replace(">", "\\u003e").replace("&", "\\u0026")
+    html = _HTML_TEMPLATE.replace("__MIXER_DASHBOARD_HTTP_ORIGINS__", encoded)
+    # Include the exact UTF-8 script text and surrounding newlines in the hash.
+    script = html.partition("<script>")[2].partition("</script>")[0]
+    digest = b64encode(sha256(script.encode("utf-8")).digest()).decode("ascii")
+    csp = (
+        "default-src 'none'; script-src 'sha256-" + digest
+        + "'; style-src 'unsafe-inline'; connect-src 'self'; base-uri 'none'; "
+        "form-action 'none'; frame-ancestors 'none'"
+    )
+    return html, csp
+
+
+# Legacy imports remain safe, environment-independent defaults. The HTTP route
+# calls render_dashboard() to read the current operator configuration explicitly.
+HTML_PAGE, CONTENT_SECURITY_POLICY = render_dashboard({})
