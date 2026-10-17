@@ -1,0 +1,38 @@
+services:
+  mixer:
+    build: .
+    image: geminiapi-mixer:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8081:8081"
+    environment:
+      MIXER_HOST: 0.0.0.0
+      MIXER_API_KEYS: ${MIXER_API_KEYS:?Set MIXER_API_KEYS in .env}
+      MIXER_WEB_ENABLED: ${MIXER_WEB_ENABLED:-true}
+      MIXER_WEB_ALLOW_REMOTE_IMAGES: ${MIXER_WEB_ALLOW_REMOTE_IMAGES:-false}
+      MIXER_DEFAULT_MODEL: ${MIXER_DEFAULT_MODEL:-gemini-3.6-flash}
+      GEMINI_WEB2API_CONFIG: ${GEMINI_WEB2API_CONFIG:-}
+      GEMINI_WEB_PROXY: ${GEMINI_WEB_PROXY:-}
+      BUILD_API_KEY: ${BUILD_API_KEY:-}
+      BUILD_MODELS: ${BUILD_MODELS:-gemini-2.5-flash}
+      AIS_API_KEY: ${AIS_API_KEY:-}
+      AIS_MODELS: ${AIS_MODELS:-gemini-2.5-flash}
+      ANTIGRAVITY_BASE_URL: ${ANTIGRAVITY_BASE_URL:-}
+      ANTIGRAVITY_API_KEY: ${ANTIGRAVITY_API_KEY:-}
+      ANTIGRAVITY_MODELS: ${ANTIGRAVITY_MODELS:-}
+      ANTIGRAVITY_GROUP_CONFIRMED: ${ANTIGRAVITY_GROUP_CONFIRMED:-false}
+      ANTIGRAVITY_ALLOW_HTTP: ${ANTIGRAVITY_ALLOW_HTTP:-false}
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 128
+    mem_limit: 512m
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"

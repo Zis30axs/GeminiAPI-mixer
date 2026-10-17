@@ -1,0 +1,11 @@
+services:
+  mixer:
+    environment:
+      GEMINI_WEB_COOKIE_FILE: /run/secrets/gemini-cookie.json
+    volumes:
+      - type: bind
+        source: ${GEMINI_WEB_COOKIE_FILE_HOST:-./auth/cookie.json}
+        target: /run/secrets/gemini-cookie.json
+        read_only: true
+        bind:
+          create_host_path: false
