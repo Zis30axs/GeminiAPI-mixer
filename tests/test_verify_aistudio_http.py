@@ -70,6 +70,16 @@ class VerificationTests(unittest.TestCase):
         self.assertNotIn("Cookie", request.headers)
         return self.behavior(request)
 
+    def test_long_generation_wait_uses_the_requested_deadline(self):
+        received = []
+        def factory(**kwargs):
+            received.append(kwargs["timeout"])
+            return self.factory(**kwargs)
+        result = verify.probe(BASE, KEY, MODEL, "ais", False, 90, factory)
+        self.assertTrue(result["ok"])
+        self.assertEqual(received[0].read, 90)
+        self.assertEqual(received[0].connect, 10)
+
     def response(self, request, **kwargs):
         headers = {"X-Mixer-Upstream-Channel": request.headers["X-Mixer-Upstream-Channel"],
                    "X-Mixer-Channel-Locked": "1"}

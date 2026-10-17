@@ -9,6 +9,42 @@
 没有额外付费 API key 需求不代表账号一定有可用额度；服务器的权限拒绝、模型限制和额度限制仍生效。
 不创建新身份、不自动加入其他账号、不把失败请求切到 Web 或公开 API。
 
+## 本机实测状态（2026-10-17）
+
+两个自有账号已主动导入；分别使用所选会话读取 AI Studio 官方页面，页面邮箱与导出信息匹配。
+关闭全部 Edge 进程后，`gemini-3.8-flash` 的 AIS、Build 两通道均完成以下验证：
+
+| 入口 | AIS 文本 / SSE | Build 文本 / SSE |
+| --- | --- | --- |
+| Chat Completions，经现有 OpenFRP 外网入口 | 通过 / 通过 | 通过 / 通过 |
+| Responses，本机入口 | 通过 / 通过 | 通过 / 通过 |
+| Gemini 原生，本机入口 | 通过 / 通过 | 通过 / 通过 |
+
+以上共 12 项。最初的验证辅助程序把 Responses 成功响应中的 `error: null` 误判为错误，
+修正判定后重新执行对应两项并通过。外网入口测试由本机经现有公共地址发起，不代表第二台外部设备验证。
+后端运行的是 Go 进程，没有浏览器进程；单预热 Worker 阶段 Docker 采样峰值为 **215.3 MiB**，
+Mixer 约 **33–35 MiB**。双预热配置的轮询验证阶段后端采样峰值为 **247.6 MiB**，
+合并 Argon 验证阶段后的最大采样值为 **248.1 MiB**。
+这些是本次测试期间的采样值，不是完整负载峰值或长期内存保证。
+
+AIS 的 `gemini-4-argon` 也已直接验证：文本 HTTP 200，用时 14.625 秒；
+SSE HTTP 200，首段文本 15.657 秒、终态 16.188 秒，共 3 个内容事件。
+`ais-gemini-4-argon` 已启用，外网 Chat SSE 也已通过：HTTP 200，首段文本 8.297 秒，
+总耗时 8.875 秒，3 个内容事件、110 字符，收到终态及 `[DONE]`，内容分不同读取批次到达。
+第一次外网尝试在客户端 90 秒总时限到期时出现 ReadError；后端账本稍后记录该请求约 90 秒完成、
+状态 200，但这不表示客户端收到成功结果。随后仅重测此 AIS 外网请求，将客户端总时限设为 180 秒，
+得到上述完整成功结果。
+Build 的同模型返回 HTTP 429 后已停止探测，**未启用 `build-gemini-4-argon`**。
+不能根据这些结果推算剩余额度，也没有验证或启用上述模型的 low / medium / high 档位。
+
+修复官方规范账号路径跳转的补丁配合 `2 warm / 2 active` 配置，已通过真实轮询验证：
+连续四次同一 AIS 来源、同一 Flash 模型的请求均为 HTTP 200，后端账本明确记录
+`account-index-1 → account-index-0 → account-index-1 → account-index-0`，每次均无失败尝试。
+本机与外网的 `/healthz`、`/quota`、认证后的 `/v1/models`、`/v1/quota` 均为 HTTP 200；
+模型目录含 30 条，未授权的数据接口返回 401，Sub2API 原入口仍为 HTTP 200。
+自动化检查为 Python **338 项**、Node **41 项**及 **4 个 Go 包测试套件**通过。
+当前镜像、补丁校验值和分阶段记录见 [验证记录](../sidecars/aistudio2api/VALIDATION.md)。
+
 ## 来源锁定与凭据
 
 Mixer 向后端发送独立服务 Bearer key，并通过补丁限定本次请求为 Playground 或 Build。
@@ -25,6 +61,10 @@ Google 会话只挂载给后端，Mixer 仅读能力证据文件。后端 API ke
 主动导出当前账号会话，然后通过 `tools/import_aistudio_session.py` 导入指定私有目录。
 扩展无后台任务、不向网络发送 Cookie、不申请 Google Drive 授权。
 导出与导入的具体步骤见扩展 README；不要将 Cookie、下载文件或 proof 发到聊天或提交到 Git。
+
+扩展 v1.1.0 已支持 `/u/N/` 路径及当前页面 JSON 启动元信息中的邮箱，
+实现已完成独立审查和合成测试。现有 Edge 安装需要用户在扩展页重新加载；
+当前不能把源码验证或官方页面读取结果表述为扩展弹窗已经实测通过。
 
 每个账号有独立 `account.json` 和 `storage-state.json`。会话扩展中的 `auth_user` 是
 Google 当前登录账号索引，必须与用户选择的账号对应；`browser=mixer-import` 禁止后端隐式扫描个人 Chrome。
@@ -52,11 +92,13 @@ docker compose -f compose.yml -f compose.aistudio.yml up -d --build
 
 ## 多账号与资源
 
-多个用户明确导入的账号可以使用 `AISTUDIO_ROUTING_STRATEGY=round-robin` 轮询。
+多个用户明确导入的账号可以使用 `AISTUDIO_ROUTING_STRATEGY=round-robin` 在已预热的账号之间轮询。
 每个账号保留自己的身份、权益和冷却状态；这不会增加任一账号的实际授权额度。
 不要通过删除冷却数据或重复导入同一身份绕过限制。
 
-节约内存的默认值为预热 1、最多活动 Worker 1、每账号并发 1。
+节约内存的默认值为预热 1、最多活动 Worker 1、每账号并发 1。这会复用唯一可用的热账号，
+不保证逐请求切换冷账号。两个账号持续轮询需同时设置 `AISTUDIO_WARM_WORKER_LIMIT=2`
+和 `AISTUDIO_MAX_ACTIVE_WORKERS=2`，等两个 Worker 均预热完成后再核对实际请求账本。
 可以增加 `AISTUDIO_MAX_ACTIVE_WORKERS`，但必须同时测量内存，不能把账号数量当成并发能力。
 `AISTUDIO_GO_MEMORY_LIMIT=256MiB` 是 Go GC 的软目标，容器 `AISTUDIO_MEMORY_LIMIT=512m` 才是硬限制。
 内存超限会使请求失败；没有测量前不能承诺固定 MB 或相对 WebView2 的节约比例。

@@ -258,7 +258,7 @@ def probe(base, key, model, source, stream, total_timeout, client_factory=httpx.
     summary = {"ok": False}
     deadline = None
     try:
-        with client_factory(timeout=httpx.Timeout(min(20, total_timeout), connect=min(10, total_timeout)),
+        with client_factory(timeout=httpx.Timeout(total_timeout, connect=min(10, total_timeout)),
                             follow_redirects=False, trust_env=False, verify=True) as client:
             with Deadline(client, total_timeout) as deadline:
                 with client.stream("POST", base + "/v1beta/models/" + model + ":" + method,

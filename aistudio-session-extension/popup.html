@@ -7,12 +7,14 @@
 </head>
 <body>
   <h1>AI Studio 登录态导出</h1>
-  <p>先在当前 AI Studio 页面确认头像菜单中的邮箱，再填写下列信息。只保存到你选择的本机文件。</p>
+  <p>自动读取当前 AI Studio 页面的邮箱和账号索引，核对后再导出。只保存到你选择的本机文件。</p>
+  <p id="inspection" class="hint" role="status">正在读取当前页面身份信息……</p>
+  <button id="inspect" type="button">重新读取当前页面</button>
   <label for="email">当前 Google 账号邮箱</label>
   <input id="email" type="email" autocomplete="off" spellcheck="false" maxlength="254" placeholder="你自己的 Google 账号">
   <label for="account">当前账号索引</label>
   <input id="account" type="text" inputmode="numeric" autocomplete="off" maxlength="10" placeholder="独立单账号浏览器填 0">
-  <p class="hint">多账号浏览器请核对网址中的 authuser= 或 /u/ 后的数字；若网址没有显示，建议使用只登录一个账号的独立浏览器配置。扩展不会猜测账号。</p>
+  <p class="hint">支持读取 /u/1/、/u/2/、/u/3/ 等路径与 authuser= 参数。若页面没有提供可靠信息，请手动核对并填写，扩展不会默认猜成账号 0。</p>
   <label class="confirmation"><input id="confirmed" type="checkbox">我已核对当前页面，邮箱和账号索引属于我选择的账号。</label>
   <button id="export" type="button">导出本机登录文件</button>
   <p id="status" role="status" aria-live="polite"></p>

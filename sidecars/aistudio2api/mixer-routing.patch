@@ -1,5 +1,5 @@
 diff --git a/internal/aistudio/auth.go b/internal/aistudio/auth.go
-index 205dcbb..6da3880 100644
+index 205dcbb..9e783f3 100644
 --- a/internal/aistudio/auth.go
 +++ b/internal/aistudio/auth.go
 @@ -48,9 +48,10 @@ type StorageState struct {
@@ -26,7 +26,7 @@ index 205dcbb..6da3880 100644
  	raw, err := json.Marshal(extension)
  	if err != nil {
  		return fmt.Errorf("编码认证扩展: %w", err)
-@@ -97,6 +101,56 @@ func (s StorageState) AuthExtension() (AuthExtension, bool, error) {
+@@ -97,6 +101,59 @@ func (s StorageState) AuthExtension() (AuthExtension, bool, error) {
  	return extension, true, nil
  }
  
@@ -73,7 +73,10 @@ index 205dcbb..6da3880 100644
 +	if len(pathParts) >= 2 && pathParts[0] == "u" && pathParts[1] != selected {
 +		return "", fmt.Errorf("AI Studio 页面尝试切换所选账号")
 +	}
-+	if selected != "0" || query.Has("authuser") {
++	// Google canonicalizes authuser=N to /u/N/ and removes the query selector.
++	// Re-adding it to that matching path causes a canonical redirect loop.
++	pathSelectsAccount := len(pathParts) >= 2 && pathParts[0] == "u" && pathParts[1] == selected
++	if query.Has("authuser") || selected != "0" && !pathSelectsAccount {
 +		query.Set("authuser", selected)
 +	}
 +	target.RawQuery = query.Encode()
@@ -83,7 +86,7 @@ index 205dcbb..6da3880 100644
  // IsolatedLoginRequest 描述独立浏览器登录所需的稳定环境
  type IsolatedLoginRequest struct {
  	AccountID string
-@@ -150,6 +204,9 @@ func WriteStorageState(filePath string, state StorageState) error {
+@@ -150,6 +207,9 @@ func WriteStorageState(filePath string, state StorageState) error {
  
  // Validate 校验 storage state 的浏览器字段
  func (s StorageState) Validate() error {
@@ -95,10 +98,10 @@ index 205dcbb..6da3880 100644
  			return fmt.Errorf("storage state Cookie %d 缺少名称或域", index)
 diff --git a/internal/aistudio/auth_user_test.go b/internal/aistudio/auth_user_test.go
 new file mode 100644
-index 0000000..68b1b29
+index 0000000..433acc4
 --- /dev/null
 +++ b/internal/aistudio/auth_user_test.go
-@@ -0,0 +1,161 @@
+@@ -0,0 +1,219 @@
 +package aistudio
 +
 +import (
@@ -188,7 +191,11 @@ index 0000000..68b1b29
 +	for _, target := range []string{
 +		aiStudioOrigin + "/prompts/new_chat?authuser=0",
 +		aiStudioOrigin + "/prompts/new_chat?authuser=5&authuser=0",
++		aiStudioOrigin + "/u/5/prompts/new_chat?authuser=0",
++		aiStudioOrigin + "/u/5/prompts/new_chat?authuser=5&authuser=5",
 +		aiStudioOrigin + "/u/0/prompts/new_chat",
++		aiStudioOrigin + "/u/",
++		aiStudioOrigin + "/u//prompts/new_chat",
 +		"https://example.com/?authuser=5",
 +		"http://aistudio.google.com/?authuser=5",
 +		"https://user@aistudio.google.com/?authuser=5",
@@ -196,6 +203,60 @@ index 0000000..68b1b29
 +		if _, err := aiStudioAccountPageURL(target, "5"); err == nil {
 +			t.Fatalf("cross-account/origin navigation accepted: %s", target)
 +		}
++	}
++}
++
++func TestSelectedSessionCanonicalAccountPath(t *testing.T) {
++	for _, selected := range []string{"0", "1", "2", "3", "5"} {
++		for _, suffix := range []string{"", "?model=gemini-test"} {
++			target := aiStudioOrigin + "/u/" + selected + "/prompts/new_chat" + suffix
++			got, err := aiStudioAccountPageURL(target, selected)
++			if err != nil || got != target {
++				t.Fatalf("canonical selected-account path changed: got %q, error %v", got, err)
++			}
++		}
++	}
++}
++
++func TestSelectedSessionLoadPageCanonicalRedirect(t *testing.T) {
++	for _, selected := range []string{"1", "2", "3", "5"} {
++		t.Run(selected, func(t *testing.T) {
++			pageURL, err := aiStudioAccountPageURL(aiStudioOrigin+"/prompts/new_chat?model=gemini-test", selected)
++			if err != nil {
++				t.Fatal(err)
++			}
++			requests := 0
++			canonicalPath := "/u/" + selected + "/prompts/new_chat"
++			runtime := &goWAARuntime{
++				storage: selectedSessionFixture(t, selected), authUser: selected, pageURL: pageURL,
++				client: &http.Client{
++					CheckRedirect: func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse },
++					Transport: selectedSessionRoundTripper(func(request *http.Request) (*http.Response, error) {
++						requests++
++						if request.URL.Query().Has("authuser") {
++							if request.URL.Query().Get("authuser") != selected {
++								t.Fatal("initial navigation switched account")
++							}
++							return &http.Response{
++								StatusCode: http.StatusFound, Header: http.Header{"Location": {canonicalPath}},
++								Body: io.NopCloser(strings.NewReader("")), Request: request,
++							}, nil
++						}
++						if request.URL.Path != canonicalPath {
++							t.Fatal("canonical navigation lost selected account")
++						}
++						return &http.Response{
++							StatusCode: http.StatusOK, Header: http.Header{},
++							Body: io.NopCloser(strings.NewReader(`{"WIu0Nc":"test-public-key"}`)), Request: request,
++						}, nil
++					}),
++				},
++			}
++			key, err := runtime.loadPage(context.Background())
++			if err != nil || key != "test-public-key" || requests != 2 {
++				t.Fatalf("canonical navigation: key=%q, requests=%d, error=%v", key, requests, err)
++			}
++		})
 +	}
 +}
 +
