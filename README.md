@@ -80,6 +80,11 @@ Antigravity 透明转发 Chat/Responses，由选定上游校验能力；不支�
 真实剩余额度**。未知值为 `null`，查询失败为 `unavailable`，无限制单独标注；
 保留可用的周期重置时间，不以失败代替零余额。
 
+各模型账户额度及 reset 可通过可选的隔离采集器提供，Mixer 仅读脱敏快照。
+显式启用 `compose.quota.yml` 后默认每 60 秒采集，600 秒后显示过期；管理员密码/JWT
+不进入 Mixer。上游报告已用 100% 时保留“耗尽或未知”的歧义，不伪造零余额。
+配置与命令见 [模型额度说明](docs/antigravity-quota.md)。
+
 ## 验证与来源
 
 ```sh

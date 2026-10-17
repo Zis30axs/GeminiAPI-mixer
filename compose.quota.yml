@@ -1,0 +1,56 @@
+# Explicitly adding this overlay enables the isolated account-quota collector.
+services:
+  mixer:
+    environment:
+      ANTIGRAVITY_QUOTA_FILE: ${SUB2API_QUOTA_OUTPUT_FILE:-/var/lib/mixer-quota/snapshot.json}
+      ANTIGRAVITY_QUOTA_MAX_AGE_SEC: ${ANTIGRAVITY_QUOTA_MAX_AGE_SEC:-600}
+    volumes:
+      - type: volume
+        source: antigravity-quota
+        target: /var/lib/mixer-quota
+        read_only: true
+
+  quota-exporter:
+    build: .
+    image: geminiapi-mixer:local
+    command: ["python", "-m", "gemini_web2api.quota_exporter"]
+    init: true
+    restart: unless-stopped
+    stop_grace_period: 60s
+    environment:
+      PYTHONDONTWRITEBYTECODE: "1"
+      SUB2API_QUOTA_BASE_URL: ${SUB2API_QUOTA_BASE_URL:?Set the operator-controlled Sub2API quota base URL}
+      SUB2API_QUOTA_ALLOW_HTTP: ${SUB2API_QUOTA_ALLOW_HTTP:-false}
+      SUB2API_QUOTA_CREDENTIALS_FILE: /run/secrets/sub2api-quota-login.json
+      SUB2API_QUOTA_GROUP_ID: ${SUB2API_QUOTA_GROUP_ID:-4}
+      SUB2API_QUOTA_ACCOUNT_IDS: ${SUB2API_QUOTA_ACCOUNT_IDS:-2}
+      SUB2API_QUOTA_OUTPUT_FILE: ${SUB2API_QUOTA_OUTPUT_FILE:-/var/lib/mixer-quota/snapshot.json}
+      SUB2API_QUOTA_INTERVAL_SEC: ${SUB2API_QUOTA_INTERVAL_SEC:-60}
+    volumes:
+      - type: bind
+        source: ${SUB2API_QUOTA_CREDENTIALS_HOST_FILE:?Set the dedicated quota login JSON host file}
+        target: /run/secrets/sub2api-quota-login.json
+        read_only: true
+        bind:
+          create_host_path: false
+      - type: volume
+        source: antigravity-quota
+        target: /var/lib/mixer-quota
+    read_only: true
+    tmpfs:
+      - /tmp:size=16m,mode=1777
+    cap_drop:
+      - ALL
+    security_opt:
+      - no-new-privileges:true
+    pids_limit: 64
+    mem_limit: 256m
+    healthcheck:
+      disable: true
+    logging:
+      options:
+        max-size: "1m"
+        max-file: "2"
+
+volumes:
+  antigravity-quota:

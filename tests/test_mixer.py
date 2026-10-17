@@ -74,6 +74,16 @@ class MixerHTTPTests(unittest.TestCase):
         self.assertEqual(status, 200)
         self.assertNotIn("models", json.loads(body))
 
+    def test_quota_shell_is_public_but_does_not_embed_key_or_account_data(self):
+        status, headers, body = self.call("/quota", auth=False)
+        self.assertEqual(status, 200)
+        self.assertIn("text/html", headers["Content-Type"])
+        self.assertIn("frame-ancestors 'none'", headers["Content-Security-Policy"])
+        self.assertIn("script-src 'sha256-", headers["Content-Security-Policy"])
+        self.assertEqual(headers["Cache-Control"], "no-store")
+        self.assertNotIn("synthetic+mixer/key", body)
+        self.assertEqual(self.call("/v1/quota/antigravity", auth=False)[0], 401)
+
     def test_all_inference_routes_require_authentication(self):
         for path in ("/v1/chat/completions", "/v1/responses", "/v1beta/models/build-test:generateContent"):
             with self.subTest(path=path):

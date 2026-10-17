@@ -16,6 +16,7 @@ from .server import GeminiHandler
 from .providers import ProviderError, list_models, resolve_route
 from .api_formats import to_native, format_result, stream_events
 from . import antigravity
+from .quota_dashboard import HTML_PAGE, CONTENT_SECURITY_POLICY
 
 
 def web_enabled():
@@ -95,6 +96,7 @@ class MixerHandler(GeminiHandler):
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(encoded)))
+        self.send_header("Cache-Control", "no-store")
         self._source_headers()
         self.end_headers()
         self.wfile.write(encoded)
@@ -183,6 +185,19 @@ class MixerHandler(GeminiHandler):
     def do_GET(self):
         try:
             path = urlsplit(self.path).path
+            if path == "/quota":
+                # The public shell contains no account data or embedded key.
+                encoded = HTML_PAGE.encode("utf-8")
+                self.send_response(200)
+                self.send_header("Content-Type", "text/html; charset=utf-8")
+                self.send_header("Content-Length", str(len(encoded)))
+                self.send_header("Cache-Control", "no-store")
+                self.send_header("Content-Security-Policy", CONTENT_SECURITY_POLICY)
+                self.send_header("X-Content-Type-Options", "nosniff")
+                self.send_header("Referrer-Policy", "no-referrer")
+                self.end_headers()
+                self.wfile.write(encoded)
+                return
             if path in ("/", "/healthz"):
                 self.send_json({"status": "ok", "version": __version__})
                 return
@@ -238,7 +253,8 @@ class MixerHandler(GeminiHandler):
                 if kind == "gemini":
                     raise ProviderError(501, "unsupported_api", "Antigravity adapter supports Chat Completions and Responses only")
                 self._metadata = {"source": "antigravity", "transport": "sub2api-openai",
-                                  "upstream_model": alias[3:], "request_id": self._request_id}
+                                  "request_id": self._request_id}
+                self._metadata.update(antigravity.request_metadata(req, alias))
                 self._route_log(alias, stream)
                 if stream:
                     self._serve_events(antigravity.stream(req, kind, alias))
@@ -311,8 +327,9 @@ class MixerHandler(GeminiHandler):
             self._fail(ProviderError(502, "upstream_error", "Provider request failed"))
 
     def _route_log(self, alias, stream):
-        log("route request_id=%s source=%s transport=%s model=%s effort=%s stream=%s" %
+        log("route request_id=%s source=%s transport=%s model=%s upstream_model=%s effort=%s stream=%s" %
             (self._request_id, self._metadata["source"], self._metadata["transport"], alias,
+             self._metadata.get("upstream_model") or "unknown",
              self._metadata.get("requested_effort") or "default", stream))
 
     def _stream_error(self, error):
