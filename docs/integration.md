@@ -84,6 +84,11 @@ build/ais 的 Responses 支持 `input`、`instructions`、函数调用/函数结
 quota 返回的 `scope=sub2api-key-wallet` 明确不是 Google 真实余量。周期重置、余额和
 无限制标志仅来自上游已知字段。上游 429/权限不足会报错，不轮换身份规避限制。
 
+需要 Antigravity 各模型的账户额度及 reset 时，可显式叠加 `compose.quota.yml`。
+隔离采集器持有专用登录文件，Mixer 仅读共享卷中的脱敏快照；默认每 60 秒采集、
+600 秒后标记过期，不重写上游观察时间。启用命令、变量、权限边界和已用 100% 的
+歧义见 [模型额度部署说明](antigravity-quota.md)。
+
 ## 限制与时限
 
 客户端请求体默认 20 MiB、读取超时 60 秒，可用 `MIXER_MAX_REQUEST_BYTES`、
@@ -104,5 +109,5 @@ Google Provider 默认连接 10 秒、读取 60 秒、总计 180 秒；
 - [Google thought signatures](https://ai.google.dev/gemini-api/docs/generate-content/thought-signatures)
 - [AI Studio Build 的服务端 key](https://ai.google.dev/gemini-api/docs/aistudio-build-mode)
 - [OpenAI Responses SSE](https://developers.openai.com/api/reference/resources/responses/streaming-events)
-- [Sub2API 路由，核实版本](https://github.com/Wei-Shaw/sub2api/blob/b0a02a3304a0a78cdd003ddda1dd23ba02c03084/backend/internal/server/routes/gateway.go)
-- [Sub2API usage schema，核实版本](https://github.com/Wei-Shaw/sub2api/blob/b0a02a3304a0a78cdd003ddda1dd23ba02c03084/backend/internal/handler/gateway_handler.go)
+- [Sub2API 路由，运行版本](https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/internal/server/routes/gateway.go)
+- [Sub2API usage schema，运行版本](https://github.com/Wei-Shaw/sub2api/blob/3040209f205472038c1ba745a1bedd2edd9053b1/backend/internal/handler/gateway_handler.go)

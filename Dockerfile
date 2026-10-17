@@ -3,7 +3,8 @@ FROM python:3.12-slim
 WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
-RUN groupadd --gid 10001 mixer && useradd --uid 10001 --gid mixer --create-home mixer
+RUN groupadd --gid 10001 mixer && useradd --uid 10001 --gid mixer --create-home mixer \
+    && mkdir -p /var/lib/mixer-quota && chown 10001:10001 /var/lib/mixer-quota
 COPY gemini_web2api/ ./gemini_web2api/
 COPY config.example.json ./config.json
 EXPOSE 8081

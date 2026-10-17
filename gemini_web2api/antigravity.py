@@ -22,6 +22,8 @@ from urllib.parse import urlsplit
 import httpx
 
 from .providers import ProviderError
+from .antigravity_catalog import model_details, read_model_evidence, resolve_model_effort
+from .antigravity_quota import load_quota_catalog
 
 
 _MODEL_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,199}\Z")
@@ -277,12 +279,24 @@ class AntigravityProvider:
             raise ProviderError(502, "invalid_upstream_response", "Antigravity upstream returned invalid JSON.") from None
 
     @staticmethod
-    def _metadata(alias: str, model: str) -> dict:
+    def _metadata(alias: str, model: str, evidence: Optional[dict] = None, quota_catalog: Optional[dict] = None) -> dict:
+        details = model_details(model, evidence, quota_catalog)
+        verified = details["verification"]
+        if verified["status"] == "unavailable":
+            availability = "unavailable"
+        elif verified["http_status"] == 429:
+            availability = "temporarily_unavailable"
+        elif verified["status"] == "verified":
+            availability = "available"
+        else:
+            availability = "unverified"
         return {
             "source": "antigravity", "transport": "sub2api-openai",
             "model": alias, "upstream_model": model,
-            "thinking_control": "upstream-controlled", "capabilities": "unknown",
+            "capabilities": "unknown",
             "source_verification": "operator-confirmed-exclusive-group",
+            **details,
+            "availability": {"status": availability, "reason": verified["reason"]},
         }
 
     def _decorate(self, result: dict, alias: str, model: str) -> dict:
@@ -315,14 +329,17 @@ class AntigravityProvider:
         if not self.enabled:
             return []
         available = self._discover(time.monotonic() + self.total_timeout)
+        evidence, quota_catalog = read_model_evidence(), load_quota_catalog()
         return [
-            {
-                "id": "ag-" + model, "object": "model", "created": 0,
-                "owned_by": "antigravity", "source": "antigravity", "transport": "sub2api-openai",
-                "capabilities": "unknown", "x_mixer": self._metadata("ag-" + model, model),
-            }
+            self._model_row(model, evidence, quota_catalog)
             for model in self._models if model in available
+            and evidence["models"].get(model, {}).get("status") != "unavailable"
         ]
+
+    def _model_row(self, model: str, evidence: dict, quota_catalog: dict) -> dict:
+        metadata = self._metadata("ag-" + model, model, evidence, quota_catalog)
+        return {"id": "ag-" + model, "object": "model", "created": 0,
+                "owned_by": "antigravity", **metadata, "x_mixer": metadata}
 
     def _prepare(self, req: dict, api_kind: str, alias: str, deadline: float, stream: bool) -> Tuple[str, dict, str]:
         self._require_enabled()
@@ -330,14 +347,13 @@ class AntigravityProvider:
             raise ProviderError(501, "unsupported_api", "Antigravity adapter supports Chat Completions and Responses only; native Gemini is unavailable.")
         if not isinstance(req, dict) or not isinstance(alias, str) or not alias.startswith("ag-"):
             raise ProviderError(400, "invalid_model", "Antigravity model names require the ag- prefix.")
-        model = alias[3:]
+        model, body = resolve_model_effort(alias[3:], req, self._models)
         if model not in self._models:
             if _EFFORT_SUFFIX.search(model):
                 raise ProviderError(400, "unsupported_thinking_level", "Antigravity thinking suffixes require an exact allowlisted upstream model; no effort mapping is inferred.")
             raise ProviderError(404, "model_not_found", "Antigravity model is not allowlisted.")
         if model not in self._discover(deadline):
             raise ProviderError(404, "model_not_found", "Antigravity upstream does not advertise this model.")
-        body = copy.deepcopy(req)
         body["model"] = model
         body["stream"] = stream
         body.pop("x_mixer", None)
@@ -478,11 +494,16 @@ class AntigravityProvider:
 
     def quota(self) -> dict:
         self._require_enabled()
+        evidence, quota_catalog = read_model_evidence(), load_quota_catalog()
+        catalog_models = tuple(dict.fromkeys((*self._models, *evidence["models"])))
         result = {
             "source": "antigravity", "transport": "sub2api-openai", "scope": "sub2api-key-wallet",
             "status": "unknown", "remaining": None, "unit": None, "unlimited": False,
             "limit": None, "used": None, "windows": [],
             "observed_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+            "models": [self._model_row(model, evidence, quota_catalog) for model in catalog_models],
+            "model_quota_source": "sub2api-account-quota",
+            "model_quota_status": quota_catalog.get("status", "unknown"),
         }
         try:
             raw = self._read_json("GET", "/v1/usage", None, time.monotonic() + self.total_timeout)
@@ -539,6 +560,13 @@ def list_models() -> list:
 
 def quota() -> dict:
     return AntigravityProvider.from_env().quota()
+
+
+def request_metadata(req: dict, alias: str) -> dict:
+    """Resolve a verified effort before logging or emitting response headers."""
+    models = [value.strip() for value in os.environ.get("ANTIGRAVITY_MODELS", "").split(",") if value.strip()]
+    model, _body = resolve_model_effort(alias[3:], req, models)
+    return AntigravityProvider._metadata(alias, model)
 
 
 def proxy(req: dict, api_kind: str, alias: str) -> dict:

@@ -1,0 +1,12 @@
+# Optional, account-specific validation records; no credentials in this file.
+services:
+  mixer:
+    environment:
+      ANTIGRAVITY_MODEL_EVIDENCE_FILE: /run/secrets/antigravity-model-evidence.json
+    volumes:
+      - type: bind
+        source: ${ANTIGRAVITY_MODEL_EVIDENCE_HOST_FILE:?Set the validated model evidence JSON host file}
+        target: /run/secrets/antigravity-model-evidence.json
+        read_only: true
+        bind:
+          create_host_path: false
