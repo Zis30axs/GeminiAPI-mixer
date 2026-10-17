@@ -95,4 +95,5 @@ docker compose -f compose.yml -f compose.aistudio.yml up -d --build
 后端的用量账本与冷却列表不等于 Google 各模型剩余额度。
 
 自动化测试使用合成后端与本地 fixture，不能替代真实账号生成验证。
+手动生成、SSE 验收和能力证据的生成步骤见 [通道验收](aistudio-http-verification.md)。
 实际部署验证记录应分别列出账号准备、后端启动、AIS、Build、流式、内存各项结果，保留失败和未完成项。
