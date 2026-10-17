@@ -327,9 +327,10 @@ class MixerHandler(GeminiHandler):
             self._fail(ProviderError(502, "upstream_error", "Provider request failed"))
 
     def _route_log(self, alias, stream):
-        log("route request_id=%s source=%s transport=%s model=%s upstream_model=%s effort=%s stream=%s" %
+        log("route request_id=%s source=%s transport=%s model=%s upstream_model=%s effective_upstream_model=%s effort=%s stream=%s" %
             (self._request_id, self._metadata["source"], self._metadata["transport"], alias,
              self._metadata.get("upstream_model") or "unknown",
+             self._metadata.get("effective_upstream_model", self._metadata.get("upstream_model")) or "unknown",
              self._metadata.get("requested_effort") or "default", stream))
 
     def _stream_error(self, error):

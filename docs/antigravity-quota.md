@@ -110,6 +110,8 @@ low / medium / high 已生效。可用档位需要对应上游参数或账户映
 `effective_upstream_model`、`quota_model_id`、`thinking_control`、`effort` 与固定 `reason`。
 `upstream_response_model` 可记录实际响应 ID。verified 必须有成功 HTTP 状态和非未来时间。
 文件缺失或无效时能力为未知；不会激活新的 effort 映射。
+`upstream_model` 表示发送给网关的 ID，`effective_upstream_model` 是用量记录核实的实际 ID，
+`upstream_response_model` 是上游返回的模型标签；三者可能不同。别名只按明确记录关联额度桶。
 
 仅同时满足“本地 allowlist、生成实测成功、精确上游档位证据”的型号支持 body effort：
 例如已核实 `ag-gemini-3.8-flash-low` 时，`ag-gemini-3.8-flash` 配合
