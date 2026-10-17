@@ -1,7 +1,7 @@
-"""Opt-in public Gemini API profiles, separate from the legacy Web provider.
+"""Opt-in provider profiles, separate from the legacy Web provider.
 
-``build-`` and ``ais-`` identify local credential/configuration profiles. Both
-use Google's documented public API; neither executes an AI Studio webpage.
+``build-`` and ``ais-`` default to Google's documented public API. An explicit
+transport selection can instead use the operator-owned AI Studio HTTP backend.
 Capability claims are deliberately limited to reviewed model IDs. Discovery
 confirms models.list visibility, not generation quota or permission.
 """
@@ -448,6 +448,9 @@ def resolve_route(alias: Any, effort: Optional[str] = None) -> Optional[Route]:
     source = next((name for name in ("build", "ais") if alias.startswith(name + "-")), None)
     if source is None:
         return None
+    from . import aistudio_http
+    if aistudio_http.transport_mode(source) == aistudio_http.TRANSPORT:
+        return aistudio_http.resolve_route(source, alias, effort)
     requested = alias[len(source) + 1:]
     models = _configured_models(source)
     suffix_effort = None
@@ -522,6 +525,13 @@ def list_models() -> List[dict]:
     """Advertise only configured allowlist models confirmed by public discovery."""
     result = []
     for source in ("build", "ais"):
+        from . import aistudio_http
+        try:
+            if aistudio_http.transport_mode(source) == aistudio_http.TRANSPORT:
+                result.extend(aistudio_http.list_models(source))
+                continue
+        except ProviderError:
+            continue
         key = os.environ.get(source.upper() + "_API_KEY", "").strip()
         if not key:
             continue

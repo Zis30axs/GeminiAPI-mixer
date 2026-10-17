@@ -1,0 +1,11 @@
+body { box-sizing: border-box; width: 370px; margin: 0; padding: 18px; font: 14px/1.6 system-ui, sans-serif; color: #20242c; background: #f7f8fa; }
+h1 { margin: 0 0 12px; font-size: 19px; }
+p { margin: 9px 0; }
+label { display: block; margin-top: 10px; font-weight: 600; }
+input:not([type="checkbox"]) { box-sizing: border-box; width: 100%; margin-top: 4px; padding: 8px; border: 1px solid #9ba3b0; border-radius: 5px; background: white; }
+.confirmation { font-weight: 400; }
+button { width: 100%; margin-top: 14px; padding: 10px; color: white; border: 0; border-radius: 6px; background: #284f9c; font: inherit; cursor: pointer; }
+button:disabled { opacity: .55; cursor: wait; }
+#inspect { margin-top: 3px; padding: 6px; background: #e3e9f3; color: #284f9c; font-size: 12px; }
+.hint { font-size: 12px; color: #505967; }
+#status { min-height: 22px; font-weight: 600; }

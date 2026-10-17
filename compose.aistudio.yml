@@ -1,0 +1,65 @@
+services:
+  aistudio-http:
+    build:
+      context: ./sidecars/aistudio2api
+    image: geminiapi-mixer-aistudio:local
+    init: true
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:${AISTUDIO_LOCAL_PORT:-18084}:2048"
+    environment:
+      LISTEN_ADDR: 0.0.0.0:2048
+      AISTUDIO_AUTH_STATES: /data/auth
+      PROXY_API_KEY: ${AISTUDIO_HTTP_API_KEY:?Set a dedicated AISTUDIO_HTTP_API_KEY}
+      ADMIN_AUTH_ENABLED: "true"
+      ADMIN_USERNAME: ${AISTUDIO_ADMIN_USERNAME:-mixer-admin}
+      ADMIN_PASSWORD: ${AISTUDIO_ADMIN_PASSWORD:?Set AISTUDIO_ADMIN_PASSWORD}
+      WAA_BACKEND: go
+      AUTO_START: "true"
+      REQUEST_BODY_LOG: "false"
+      LOG_FILE: "false"
+      UPSTREAM_CHANNELS: playground,build
+      BUILD_NATIVE_NONSTREAM: "false"
+      ROUTING_STRATEGY: ${AISTUDIO_ROUTING_STRATEGY:-round-robin}
+      WARM_WORKER_LIMIT: ${AISTUDIO_WARM_WORKER_LIMIT:-1}
+      MAX_ACTIVE_WORKERS: ${AISTUDIO_MAX_ACTIVE_WORKERS:-1}
+      WARM_STARTUP_CONCURRENCY: "1"
+      PER_ACCOUNT_CONCURRENCY: ${AISTUDIO_PER_ACCOUNT_CONCURRENCY:-1}
+      INIT_TIMEOUT: 2m
+      REQUEST_TIMEOUT: 3m
+      GOMEMLIMIT: ${AISTUDIO_GO_MEMORY_LIMIT:-256MiB}
+      PROXY: ${AISTUDIO_PROXY:-}
+    volumes:
+      - type: bind
+        source: ${AISTUDIO_DATA_DIR:-./auth/aistudio-http}
+        target: /data
+        bind:
+          create_host_path: false
+    read_only: true
+    tmpfs:
+      - /tmp:size=64m,mode=1777
+    cap_drop: [ALL]
+    security_opt: [no-new-privileges:true]
+    pids_limit: 64
+    mem_limit: ${AISTUDIO_MEMORY_LIMIT:-512m}
+    logging:
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+  mixer:
+    environment:
+      AIS_TRANSPORT: aistudio-http
+      BUILD_TRANSPORT: aistudio-http
+      AISTUDIO_HTTP_BASE_URL: http://aistudio-http:2048
+      AISTUDIO_HTTP_API_KEY: ${AISTUDIO_HTTP_API_KEY:?Set a dedicated AISTUDIO_HTTP_API_KEY}
+      AISTUDIO_HTTP_ALLOW_HTTP: "true"
+      AISTUDIO_HTTP_EVIDENCE_FILE: /run/aistudio-evidence.json
+      AISTUDIO_HTTP_EVIDENCE_MAX_AGE_SEC: ${AISTUDIO_HTTP_EVIDENCE_MAX_AGE_SEC:-604800}
+    volumes:
+      - type: bind
+        source: ${AISTUDIO_EVIDENCE_FILE:-./auth/aistudio-http/evidence.json}
+        target: /run/aistudio-evidence.json
+        read_only: true
+        bind:
+          create_host_path: false

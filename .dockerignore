@@ -18,3 +18,8 @@ tests
 *.log
 gemini-cookie-sync-extension
 cloudflare
+storage-state.json
+aistudio-session-*.json
+aistudio-session-extension
+sidecars
+tools
