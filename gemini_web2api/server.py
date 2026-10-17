@@ -45,6 +45,9 @@ def _upload_images(images: list) -> list:
 
 
 class GeminiHandler(BaseHTTPRequestHandler):
+    def _stream_error(self, error):
+        log(f"Stream error: {type(error).__name__}")
+
     def log_message(self, fmt, *args):
         client_ip = self.client_address[0] if self.client_address else "-"
         log(f"{client_ip} {fmt % args}")
@@ -166,7 +169,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
         except (BrokenPipeError, ConnectionResetError):
             pass
         except Exception as e:
-            log(f"POST error: {e}")
+            log(f"POST error: {type(e).__name__}")
             try:
                 self.send_json({"error": {"message": str(e)}}, 500)
             except:
@@ -244,7 +247,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Stream error: {e}")
+                self._stream_error(e)
             return
 
         try:
@@ -616,7 +619,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
             except (BrokenPipeError, ConnectionResetError):
                 pass
             except Exception as e:
-                log(f"Google stream error: {e}")
+                self._stream_error(e)
             return
 
         try:

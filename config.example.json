@@ -8,9 +8,7 @@
   "auth_user": null,
   "xsrf_token": null,
   "default_model": "gemini-3.6-flash",
-  "api_keys": [
-    "sk-gemini"
-  ],
+  "api_keys": [],
   "cookie_file": null,
   "proxy": null,
   "log_requests": true,

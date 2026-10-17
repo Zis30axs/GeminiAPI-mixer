@@ -4,6 +4,7 @@ from contextlib import ExitStack
 import contextlib
 import io
 import json
+import os
 from pathlib import Path
 import subprocess
 import tempfile
@@ -46,11 +47,10 @@ class FakeProcess:
 
 class PoolManagerTests(unittest.TestCase):
     def setUp(self):
-        # Keep every fixture under this chat's work directory. No real account,
+        # Keep fixtures in a configurable work directory. No real account,
         # imported credential, user Downloads file, or real service is accessed.
-        workspace = Path(__file__).resolve().parents[3]
-        work = workspace / "work"
-        work.mkdir(exist_ok=True)
+        work = Path(os.environ.get("MIXER_TEST_WORK_DIR", str(Path(__file__).resolve().parents[1] / "work")))
+        work.mkdir(parents=True, exist_ok=True)
         self.fixture = tempfile.TemporaryDirectory(prefix="pool-manager-test-", dir=work)
         self.root = Path(self.fixture.name).resolve()
         if not self.root.is_relative_to(work.resolve()):

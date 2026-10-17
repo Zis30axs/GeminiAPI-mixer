@@ -207,5 +207,5 @@ def fetch_image_bytes(url: str) -> bytes:
         with resp:
             return resp.read()
     except Exception as e:
-        log(f"Image fetch failed: {e}")
+        log(f"Image fetch failed: {type(e).__name__}")
         return b""

@@ -7,3 +7,14 @@ config.json
 cookie.txt
 cookie.json
 .env
+.env.*
+auth
+logs
+backups
+diagnostics
+outputs
+work
+tests
+*.log
+gemini-cookie-sync-extension
+cloudflare

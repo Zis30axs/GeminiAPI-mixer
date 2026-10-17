@@ -22,6 +22,20 @@ DEFAULT_CONFIG = {
 CONFIG = dict(DEFAULT_CONFIG)
 
 
+def load_environment():
+    """Environment overrides for the mixer; never serialize runtime secrets."""
+    mapping = {"MIXER_HOST": "host", "MIXER_DEFAULT_MODEL": "default_model",
+               "GEMINI_WEB_COOKIE_FILE": "cookie_file", "GEMINI_WEB_PROXY": "proxy"}
+    for variable, field in mapping.items():
+        if variable in os.environ:
+            CONFIG[field] = os.environ[variable]
+    if "MIXER_PORT" in os.environ:
+        CONFIG["port"] = int(os.environ["MIXER_PORT"])
+    if "MIXER_API_KEYS" in os.environ:
+        CONFIG["api_keys"] = [key.strip() for key in os.environ["MIXER_API_KEYS"].split(",") if key.strip()]
+    return CONFIG
+
+
 def load_config(path: str = None):
     """Load config from JSON file."""
     if path and os.path.exists(path):
