@@ -16,6 +16,7 @@ from .server import GeminiHandler
 from .providers import ProviderError, list_models, resolve_route
 from .api_formats import to_native, format_result, stream_events
 from . import antigravity
+from . import openai_provider
 from . import aistudio_http
 from .quota_dashboard import render_dashboard
 from .web_accounts import lease_account, current_account
@@ -220,14 +221,16 @@ class MixerHandler(GeminiHandler):
             if not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
+            if self.headers.get("X-Mixer-Upstream-Hop") is not None:
+                raise ProviderError(508, "provider_loop_detected", "An upstream gateway points back to Mixer.")
             if path in ("/v1/models", "/v1beta/models"):
-                models = web_models() + list_models() + antigravity.list_models()
+                models = web_models() + list_models() + antigravity.list_models() + openai_provider.list_models()
                 if path == "/v1/models":
                     self.send_json({"object": "list", "data": models})
                 else:
                     self.send_json({"models": [dict(m, name="models/" + m["id"],
                         displayName=m["id"], supportedGenerationMethods=(
-                            [] if m.get("source") == "antigravity" else
+                            [] if m.get("source") in ("antigravity", "openai") else
                             ["generateContent"] + (["streamGenerateContent"] if
                                 m.get("transport") != aistudio_http.TRANSPORT or
                                 m.get("capabilities", {}).get("streaming") is True else []))) for m in models]})
@@ -247,6 +250,8 @@ class MixerHandler(GeminiHandler):
             if not self._authorized():
                 self.send_json({"error": {"message": "invalid api key"}}, 401)
                 return
+            if self.headers.get("X-Mixer-Upstream-Hop") is not None:
+                raise ProviderError(508, "provider_loop_detected", "An upstream gateway points back to Mixer.")
             path = urlsplit(self.path).path
             native = re.fullmatch(r"/(?:v1beta|v1)/models/([^/]+):(generateContent|streamGenerateContent)", path)
             if path not in ("/v1/chat/completions", "/v1/responses") and not native:
@@ -267,6 +272,18 @@ class MixerHandler(GeminiHandler):
             stream = native[2] == "streamGenerateContent" if native else req.get("stream", False)
             if not isinstance(stream, bool):
                 raise ProviderError(400, "invalid_request", "stream must be a boolean")
+            if openai_provider.owns_model(alias):
+                self._metadata = {"source": "openai", "transport": openai_provider.TRANSPORT,
+                                  "request_id": self._request_id}
+                if kind == "gemini":
+                    raise ProviderError(501, "unsupported_api", "OpenAI adapter supports Chat Completions and Responses only")
+                self._metadata.update(openai_provider.request_metadata(req, alias))
+                self._route_log(alias, stream)
+                if stream:
+                    self._serve_events(openai_provider.stream(req, kind, alias))
+                else:
+                    self.send_json(openai_provider.proxy(req, kind, alias))
+                return
             if alias.startswith("ag-"):
                 if kind == "gemini":
                     raise ProviderError(501, "unsupported_api", "Antigravity adapter supports Chat Completions and Responses only")

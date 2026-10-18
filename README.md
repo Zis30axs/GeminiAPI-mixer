@@ -1,7 +1,7 @@
 # GeminiAPI Mixer
 
 保留现有 Gemini Web Provider，按模型前缀路由到 AI Studio 公共 API 或自托管纯 Go 会话后端，
-并可连接自托管 Sub2API 的 Antigravity 专属分组。提供 Chat Completions、
+并可连接自托管 Sub2API 的 Antigravity 和 OpenAI 专属分组。提供 Chat Completions、
 Responses、Gemini 原生 API、SSE 和带来源信息的模型列表。
 
 ## 来源与实现边界
@@ -12,6 +12,7 @@ Responses、Gemini 原生 API、SSE 和带来源信息的模型列表。
 | `build-<model>[-low/medium/high]` | `build` / `google-gemini-public-api` 或 `aistudio-http` | 默认公开 API；可显式切到自托管 Build 会话通道 |
 | `ais-<model>[-low/medium/high]` | `ais` / `google-gemini-public-api` 或 `aistudio-http` | 默认公开 API；可显式切到自托管 Playground 会话通道 |
 | `ag-<upstream-model>` | `antigravity` / `sub2api-openai` | 用户自托管 Sub2API；API key 必须绑定 Antigravity 专属分组 |
+| 原名 `gpt-*` / `chatgpt-*` / `o*` | `openai` / `sub2api-openai` | 独立 OpenAI 专属分组；只列出 allowlist 与实际模型发现的交集 |
 
 默认公开 API 模式中的 `build-`、`ais-` 是独立凭据/模型配置，**不是独立的网页额度池**。
 可选 [纯 Go 会话模式](docs/aistudio-http.md) 复用固定版本的自托管 AIStudio2API，
@@ -20,6 +21,9 @@ Mixer 只持有独立服务密钥，通过补丁锁定每个请求的实际通�
 私有协议兼容性、账号权益和额度仍由上游决定，启用配置不等于真实生成已经验证。来源同时出现在
 `/v1/models`、路由日志、`X-Mixer-Source` / `X-Mixer-Transport` 响应头和可用的
 JSON/SSE 元信息中；所有响应带 `X-Request-ID`。
+
+客户端可用同一个 Mixer `/v1` 地址和 Mixer Key 访问这些来源。GPT 接入及
+DeepSeekHarness 配置边界见 [统一入口说明](docs/unified-openai.md)。
 
 ## 启动
 
