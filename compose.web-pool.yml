@@ -1,0 +1,12 @@
+services:
+  mixer:
+    environment:
+      GEMINI_WEB_ACCOUNTS_FILE: /run/secrets/web-accounts/manifest.json
+      GEMINI_WEB_RATE_LIMIT_COOLDOWN_SEC: ${GEMINI_WEB_RATE_LIMIT_COOLDOWN_SEC:-300}
+    volumes:
+      - type: bind
+        source: ${GEMINI_WEB_ACCOUNTS_DIR_HOST:-./auth/web-accounts}
+        target: /run/secrets/web-accounts
+        read_only: true
+        bind:
+          create_host_path: false

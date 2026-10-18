@@ -18,6 +18,7 @@ from .api_formats import to_native, format_result, stream_events
 from . import antigravity
 from . import aistudio_http
 from .quota_dashboard import render_dashboard
+from .web_accounts import lease_account, current_account
 
 
 def web_enabled():
@@ -77,11 +78,19 @@ class MixerHandler(GeminiHandler):
             effort = self._metadata.get("requested_effort")
             if effort:
                 self.send_header("X-Mixer-Requested-Effort", effort)
+            if self._metadata.get("web_account"):
+                self.send_header("X-Mixer-Web-Account", self._metadata["web_account"])
 
     def send_json(self, data, status=200):
         if self._sse_started:
             raise RuntimeError("JSON cannot follow SSE headers")
         if status >= 500 and (self._metadata or {}).get("source") == "web" and isinstance(data, dict):
+            account = current_account()
+            if account is not None and account.failure is not None:
+                error = account.failure
+                data = {"error": {"message": error.message, "code": error.code, "type": error.code}}
+                status = error.status
+                return self._send_json_response(data, status)
             # Legacy transports may include full header values in exception strings.
             raw_error = data.get("error", {})
             raw_message = raw_error.get("message", "") if isinstance(raw_error, dict) else ""
@@ -90,6 +99,9 @@ class MixerHandler(GeminiHandler):
             if code:
                 message += " (BardErrorInfo [" + code[1] + "])"
             data = {"error": {"message": message, "code": "web_upstream_error"}}
+        return self._send_json_response(data, status)
+
+    def _send_json_response(self, data, status):
         if isinstance(data, dict) and self._metadata:
             existing = data.get("x_mixer") if isinstance(data.get("x_mixer"), dict) else {}
             data = dict(data, x_mixer=dict(existing, **self._metadata))
@@ -181,7 +193,9 @@ class MixerHandler(GeminiHandler):
                 # No success terminator follows a failed stream.
                 self._emit("error", dict(payload, request_id=self._request_id))
         else:
-            self.send_json(payload, error.status)
+            # ProviderError contains deliberately safe messages. Legacy Web
+            # exception strings still pass through send_json's redaction.
+            self._send_json_response(payload, error.status)
 
     def do_GET(self):
         try:
@@ -288,17 +302,20 @@ class MixerHandler(GeminiHandler):
                 self._validate_legacy_images(req)
                 self._metadata = {"source": "web", "transport": "gemini-web-private-rpc",
                                   "model_identity": "unverified-web-preset", "request_id": self._request_id}
-                self._route_log(alias, stream)
                 # The old parsing/generation behavior remains isolated here.
                 old_path = self.path
                 self.path = ("/v1beta/models/" + alias + ":" + native[2]) if native else path
                 try:
-                    if kind == "chat":
-                        super()._handle_chat(body)
-                    elif kind == "responses":
-                        super()._handle_responses(body)
-                    else:
-                        super()._handle_google_generate(body, stream)
+                    with lease_account() as account:
+                        if account is not None:
+                            self._metadata["web_account"] = account.id
+                        self._route_log(alias, stream)
+                        if kind == "chat":
+                            super()._handle_chat(body)
+                        elif kind == "responses":
+                            super()._handle_responses(body)
+                        else:
+                            super()._handle_google_generate(body, stream)
                 finally:
                     self.path = old_path
                 return
@@ -336,16 +353,21 @@ class MixerHandler(GeminiHandler):
             self._fail(ProviderError(502, "upstream_error", "Provider request failed"))
 
     def _route_log(self, alias, stream):
-        log("route request_id=%s source=%s transport=%s model=%s upstream_model=%s effective_upstream_model=%s effort=%s stream=%s upstream_channel=%s thinking_level=%s thinking_budget=%s" %
+        log("route request_id=%s source=%s transport=%s model=%s upstream_model=%s effective_upstream_model=%s effort=%s stream=%s upstream_channel=%s thinking_level=%s thinking_budget=%s web_account=%s" %
             (self._request_id, self._metadata["source"], self._metadata["transport"], alias,
              self._metadata.get("upstream_model") or "unknown",
              self._metadata.get("effective_upstream_model", self._metadata.get("upstream_model")) or "unknown",
              self._metadata.get("requested_effort") or "default", stream,
              self._metadata.get("upstream_channel") or "default",
              self._metadata.get("effective_thinking_level") or "default",
-             self._metadata.get("effective_thinking_budget", "default")))
+             self._metadata.get("effective_thinking_budget", "default"),
+             self._metadata.get("web_account", "legacy")))
 
     def _stream_error(self, error):
+        account = current_account()
+        if account is not None and account.failure is not None:
+            self._fail(account.failure)
+            return
         self._fail(ProviderError(502, "web_upstream_error", "Gemini Web stream failed"))
 
     def _validate_legacy_images(self, value):

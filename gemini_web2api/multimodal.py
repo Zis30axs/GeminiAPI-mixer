@@ -12,11 +12,16 @@ from urllib.parse import urlparse
 
 from .config import CONFIG
 from .gemini import load_cookie, make_sapisidhash, _get_ssl_ctx, log
+from .web_accounts import current_account, request_config, observe_http_error, capture_http_errors
+
+
+def _config():
+    return request_config(CONFIG)
 
 
 def _get_page_tokens() -> dict:
     """Fetch WIZ_global_data tokens from the configured Gemini account page."""
-    auth_user = CONFIG.get("auth_user")
+    auth_user = _config().get("auth_user")
     account_prefix = "" if auth_user is None or auth_user == "" else f"/u/{auth_user}"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
@@ -33,7 +38,7 @@ def _get_page_tokens() -> dict:
         req = urllib.request.Request(
             f"https://gemini.google.com{account_prefix}/app", headers=headers
         )
-        proxy = CONFIG.get("proxy")
+        proxy = _config().get("proxy")
         if proxy:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
@@ -61,7 +66,8 @@ def _get_page_tokens() -> dict:
             if m:
                 tokens["at"] = json.loads('"' + m.group(1) + '"')
         return tokens
-    except Exception:
+    except Exception as error:
+        observe_http_error(error)
         log("Page token fetch failed")
         return {}
 
@@ -78,15 +84,17 @@ def _cached_page_tokens(max_age: int = 600) -> dict:
     cache.
     """
     cookie, _ = load_cookie()
+    account = current_account()
+    cache = account.page_tokens if account is not None else _page_tokens_cache
     # Invalidate after an account, Cookie or proxy change without retaining secrets.
-    key = (CONFIG.get("auth_user"), hashlib.sha256(cookie.encode()).digest(), CONFIG.get("proxy"))
-    with _page_tokens_lock:
+    key = (_config().get("auth_user"), hashlib.sha256(cookie.encode()).digest(), _config().get("proxy"))
+    with account.page_lock if account is not None else _page_tokens_lock:
         now = time.time()
-        if (max_age <= 0 or now - _page_tokens_cache["ts"] > max_age
-                or _page_tokens_cache.get("key") != key):
+        if (max_age <= 0 or now - cache["ts"] > max_age
+                or cache.get("key") != key):
             tokens = _get_page_tokens()
-            _page_tokens_cache.update(tokens=tokens, ts=now if tokens else 0, key=key)
-        return dict(_page_tokens_cache["tokens"])
+            cache.update(tokens=tokens, ts=now if tokens else 0, key=key)
+        return dict(cache["tokens"])
 
 
 def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
@@ -114,6 +122,7 @@ def detect_image_mime(image_bytes: bytes, fallback: str = "image/png") -> str:
     return fallback
 
 
+@capture_http_errors()
 def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str = "image/png") -> str:
     """Upload image via Scotty resumable upload. Returns file reference path."""
     tokens = _cached_page_tokens()
@@ -122,7 +131,7 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
 
     cookie_str, sapisid = load_cookie()
     ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
+    proxy = _config().get("proxy")
 
     # Step 1: Initiate resumable upload
     start_headers = {
@@ -136,6 +145,9 @@ def upload_image(image_bytes: bytes, filename: str = "image.png", mime_type: str
         "Content-Type": "application/x-www-form-urlencoded;charset=utf-8",
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
     }
+    auth_user = _config().get("auth_user")
+    if auth_user is not None and auth_user != "":
+        start_headers["X-Goog-AuthUser"] = str(auth_user)
     if cookie_str:
         start_headers["Cookie"] = cookie_str
     if sapisid:
@@ -195,7 +207,7 @@ def fetch_image_bytes(url: str) -> bytes:
         return b""
     try:
         req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
-        proxy = CONFIG.get("proxy")
+        proxy = _config().get("proxy")
         if proxy:
             opener = urllib.request.build_opener(
                 urllib.request.ProxyHandler({"http": proxy, "https": proxy}),

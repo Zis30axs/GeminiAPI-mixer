@@ -25,10 +25,15 @@ except ImportError:
 from .config import CONFIG
 from .models import build_model_routing_headers
 from .thoughts import StreamAccumulator, extract_generation
+from .web_accounts import current_account, request_config, observe_http_error, reject_http_status
 
 _ssl_ctx = None
 _cookie_cache = {"str": "", "sapisid": None, "mtime": 0}
 _httpx_client = None
+
+
+def _config():
+    return request_config(CONFIG)
 
 
 class GeminiUpstreamError(RuntimeError):
@@ -36,7 +41,7 @@ class GeminiUpstreamError(RuntimeError):
 
 
 def log(msg: str):
-    if CONFIG["log_requests"]:
+    if _config()["log_requests"]:
         import sys
         sys.stderr.write(f"[{time.strftime('%H:%M:%S')}] {msg}\n")
         sys.stderr.flush()
@@ -51,16 +56,27 @@ def _get_ssl_ctx():
 
 def _get_httpx_client():
     global _httpx_client
+    account = current_account()
+    if account is not None:
+        if account.client is None and HAS_HTTPX:
+            proxy = _config().get("proxy")
+            transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
+            account.client = httpx.Client(transport=transport, timeout=_config()["request_timeout_sec"],
+                                         verify=True, trust_env=False, follow_redirects=False)
+        return account.client
     if _httpx_client is None and HAS_HTTPX:
-        proxy = CONFIG.get("proxy")
+        proxy = _config().get("proxy")
         transport = httpx.HTTPTransport(proxy=proxy) if proxy else None
-        _httpx_client = httpx.Client(transport=transport, timeout=CONFIG["request_timeout_sec"], verify=True)
+        _httpx_client = httpx.Client(transport=transport, timeout=_config()["request_timeout_sec"], verify=True)
     return _httpx_client
 
 
 def load_cookie() -> tuple:
     """Load cookie from file with mtime-based caching."""
-    cookie_file = CONFIG.get("cookie_file")
+    account = current_account()
+    if account is not None:
+        return account.cookie
+    cookie_file = _config().get("cookie_file")
     if not cookie_file or not os.path.exists(cookie_file):
         return "", None
     try:
@@ -92,7 +108,7 @@ def make_sapisidhash(sapisid: str) -> str:
 
 def _account_prefix() -> str:
     """Return the Gemini account path prefix for non-default Google accounts."""
-    auth_user = CONFIG.get("auth_user")
+    auth_user = _config().get("auth_user")
     if auth_user is None or auth_user == "":
         return ""
     return f"/u/{auth_user}"
@@ -112,7 +128,7 @@ def _build_headers(model_id=None, think_mode=None, model_name=None, request_uuid
     if request_uuid:
         headers["x-goog-ext-525005358-jspb"] = json.dumps([request_uuid, 1], separators=(",", ":"))
     if account_prefix:
-        headers["X-Goog-AuthUser"] = str(CONFIG["auth_user"])
+        headers["X-Goog-AuthUser"] = str(_config()["auth_user"])
     cookie_str, sapisid = load_cookie()
     if cookie_str:
         headers["Cookie"] = cookie_str
@@ -123,7 +139,7 @@ def _build_headers(model_id=None, think_mode=None, model_name=None, request_uuid
 
 def _apply_chat_persistence_flags(inner: list) -> None:
     """Apply Gemini Web persistence flags to an outgoing request payload."""
-    if CONFIG.get("temporary_chats", False):
+    if _config().get("temporary_chats", False):
         # Match Gemini Web temporary-chat requests.
         inner[41] = [1]
         inner[45] = 1
@@ -180,8 +196,8 @@ def _build_payload(prompt: str, model_id: int, think_mode: int, file_refs: list 
         inner[80] = 1
     outer = [None, json.dumps(inner)]
     params = {"f.req": json.dumps(outer)}
-    if xsrf_token or CONFIG.get("xsrf_token"):
-        params["at"] = xsrf_token or CONFIG["xsrf_token"]
+    if xsrf_token or _config().get("xsrf_token"):
+        params["at"] = xsrf_token or _config()["xsrf_token"]
     return urllib.parse.urlencode(params)
 
 
@@ -189,7 +205,7 @@ def _get_url(session_id: str = None) -> str:
     reqid = int(time.time()) % 1000000
     account_prefix = _account_prefix()
     params = {
-        "bl": CONFIG["gemini_bl"],
+        "bl": _config()["gemini_bl"],
         "hl": "en",
         "_reqid": reqid,
         "rt": "c",
@@ -306,17 +322,18 @@ def _generate_file_raw_with_curl(prompt: str, model_id: int, think_mode: int, fi
     request_args = {
         "data": body,
         "headers": headers,
-        "timeout": CONFIG["request_timeout_sec"],
+        "timeout": _config()["request_timeout_sec"],
         "impersonate": "chrome",
     }
-    if CONFIG.get("proxy"):
-        request_args["proxy"] = CONFIG["proxy"]
+    if _config().get("proxy"):
+        request_args["proxy"] = _config()["proxy"]
 
-    attempts = max(1, int(CONFIG["retry_attempts"]))
+    attempts = max(1, int(_config()["retry_attempts"]))
     for attempt in range(attempts):
         response = None
         try:
             response = curl_requests.post(url, **request_args)
+            reject_http_status(response.status_code, response.headers)
             if response.status_code >= 400:
                 raise RuntimeError(f"Gemini image request failed: HTTP {response.status_code}")
             raw = response.text
@@ -326,13 +343,14 @@ def _generate_file_raw_with_curl(prompt: str, model_id: int, think_mode: int, fi
             return raw
         except GeminiUpstreamError:
             raise
-        except Exception:
+        except Exception as error:
+            observe_http_error(error)
             if attempt == attempts - 1:
                 if response is not None and response.status_code >= 400:
                     raise RuntimeError(f"Gemini image request failed: HTTP {response.status_code}") from None
                 raise RuntimeError("Gemini image request failed (transport or response error)") from None
             log(f"File generation retry {attempt+1}/{attempts}")
-            time.sleep(CONFIG["retry_delay_sec"])
+            time.sleep(_config()["retry_delay_sec"])
         finally:
             if response is not None:
                 response.close()
@@ -354,10 +372,10 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
     url = _get_url()
     headers = _build_headers(model_id, think_mode, model_name)
     ctx = _get_ssl_ctx()
-    proxy = CONFIG.get("proxy")
+    proxy = _config().get("proxy")
 
     last_err = None
-    for attempt in range(CONFIG["retry_attempts"]):
+    for attempt in range(_config()["retry_attempts"]):
         try:
             req = urllib.request.Request(url, data=body, headers=headers, method="POST")
             if proxy:
@@ -365,18 +383,19 @@ def generate(prompt: str, model_id: int, think_mode: int, file_refs: list = None
                     urllib.request.ProxyHandler({"http": proxy, "https": proxy}),
                     urllib.request.HTTPSHandler(context=ctx)
                 )
-                resp = opener.open(req, timeout=CONFIG["request_timeout_sec"])
+                resp = opener.open(req, timeout=_config()["request_timeout_sec"])
             else:
-                resp = urllib.request.urlopen(req, context=ctx, timeout=CONFIG["request_timeout_sec"])
+                resp = urllib.request.urlopen(req, context=ctx, timeout=_config()["request_timeout_sec"])
             raw = resp.read().decode("utf-8", errors="replace")
             return extract_response_text(raw)
         except GeminiUpstreamError:
             raise
         except Exception as e:
+            observe_http_error(e)
             last_err = e
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Retry {attempt+1}/{CONFIG['retry_attempts']}: {type(e).__name__}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            if attempt < _config()["retry_attempts"] - 1:
+                log(f"Retry {attempt+1}/{_config()['retry_attempts']}: {type(e).__name__}")
+                time.sleep(_config()["retry_delay_sec"])
     raise last_err
 
 
@@ -398,7 +417,7 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
 
     last_err = None
     emitted = False
-    for attempt in range(CONFIG["retry_attempts"]):
+    for attempt in range(_config()["retry_attempts"]):
         try:
             accumulator = StreamAccumulator(clean_text)
             with client.stream("POST", url, content=body, headers=headers) as resp:
@@ -433,10 +452,11 @@ def generate_stream(prompt: str, model_id: int, think_mode: int, file_refs: list
         except GeminiUpstreamError:
             raise
         except Exception as e:
+            observe_http_error(e)
             last_err = e
             if emitted:
                 raise
-            if attempt < CONFIG["retry_attempts"] - 1:
-                log(f"Stream retry {attempt+1}/{CONFIG['retry_attempts']}: {type(e).__name__}")
-                time.sleep(CONFIG["retry_delay_sec"])
+            if attempt < _config()["retry_attempts"] - 1:
+                log(f"Stream retry {attempt+1}/{_config()['retry_attempts']}: {type(e).__name__}")
+                time.sleep(_config()["retry_delay_sec"])
     raise last_err
