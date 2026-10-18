@@ -205,6 +205,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and (not tools or tool_choice == "none"):
             file_values = None
+            values = None
             if file_refs:
                 try:
                     file_values = list(generate_stream(
@@ -248,6 +249,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 self._stream_error(e)
+            finally:
+                close = getattr(values, "close", None)
+                if close:
+                    close()
             return
 
         try:
@@ -575,6 +580,7 @@ class GeminiHandler(BaseHTTPRequestHandler):
 
         if stream and not has_tools:
             file_values = None
+            values = None
             if file_refs:
                 try:
                     file_values = list(generate_stream(
@@ -620,6 +626,10 @@ class GeminiHandler(BaseHTTPRequestHandler):
                 pass
             except Exception as e:
                 self._stream_error(e)
+            finally:
+                close = getattr(values, "close", None)
+                if close:
+                    close()
             return
 
         try:

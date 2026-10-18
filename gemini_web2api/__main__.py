@@ -7,6 +7,8 @@ from .models import MODELS
 from .gemini import HAS_HTTPX
 from .server import ThreadedServer
 from .mixer import MixerHandler
+from .web_accounts import get_pool
+from .providers import ProviderError
 from . import __version__
 
 
@@ -39,6 +41,10 @@ def main():
     if allow_anonymous and CONFIG["host"] not in ("127.0.0.1", "::1", "localhost"):
         parser.error("Unauthenticated mode requires a loopback bind address")
 
+    try:
+        web_pool = get_pool()
+    except ProviderError as error:
+        parser.error(error.message)
     port = CONFIG["port"]
     server = ThreadedServer((CONFIG["host"], port), MixerHandler)
     print(f"GeminiAPI Mixer (Gemini Web compatibility v{__version__})")
@@ -46,6 +52,8 @@ def main():
     print(f"  Base URL:  http://localhost:{port}/v1")
     print(f"  Models:    {', '.join(MODELS.keys())}")
     print(f"  Cookie:    {'yes' if CONFIG.get('cookie_file') else 'none (anonymous)'}")
+    if web_pool is not None:
+        print(f"  Web pool:  {len(web_pool.accounts)} accounts; one active request per account")
     print(f"  Proxy:     {'configured' if CONFIG.get('proxy') else 'not configured'}")
     print(f"  Streaming: {'httpx (true streaming)' if HAS_HTTPX else 'urllib (buffered)'}")
     print(f"  Temporary: {'yes' if CONFIG.get('temporary_chats', False) else 'no'}")
@@ -56,6 +64,8 @@ def main():
         print("\nStopped.")
     finally:
         server.server_close()
+        if web_pool is not None:
+            web_pool.close()
 
 
 if __name__ == "__main__":
