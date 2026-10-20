@@ -112,3 +112,9 @@ node --test tests/test_cookie_extension.cjs
 - [原 Gemini Web 文档](docs/upstream-gemini-web_CN.md)
 
 本仓库保留 GPLv3 LICENSE，导入的 MIT 代码通知位于 `licenses/`。
+## Local Gemini session maintenance
+
+For an existing local deployment, the native session entry imports Gemini Web,
+AIS and Build exports, backs up replacements and runs short health probes.
+No browser process or new HTTP listener is needed. See the
+[local session entry guide](docs/local-session-entry.md).
