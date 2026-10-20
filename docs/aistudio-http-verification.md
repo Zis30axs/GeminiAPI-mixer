@@ -1,3 +1,5 @@
+> 历史验收工具说明：下述证据文件已不再作为 AIS/Build 运行门槛。无需执行这些步骤即可使用参数、工具、图片和流式。
+
 # AI Studio HTTP 通道验收
 
 `tools/verify_aistudio_http.py` 是手动验收工具，不会自动运行。它使用固定、无个人数据的短提示词，分别检查 Playground 和 Build 的一次原生生成与一次原生 SSE。请先在当前进程环境中安全设置 `AISTUDIO_HTTP_BASE_URL` 和 `AISTUDIO_HTTP_API_KEY`；普通 HTTP 还需要 `AISTUDIO_HTTP_ALLOW_HTTP=true`。密钥不要放入命令行参数或提交到仓库。
