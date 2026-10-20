@@ -68,7 +68,7 @@ def open_window(manager):
         return button
 
     status_var = tk.StringVar(value="正在读取本机状态…")
-    auto = tk.BooleanVar(value=True)
+    auto = tk.BooleanVar(value=False)
     streaming = tk.BooleanVar(value=False)
     channels = {s: tk.BooleanVar(value=True) for s in ("web", "ais", "build")}
 
@@ -145,7 +145,7 @@ def open_window(manager):
         mixer = "正常" if snapshot.get("mixer_reachable") else "无法连接"
         service_var.set("Mixer：" + mixer + "    ·    只检查本机    ·    测活使用 Gemini 3.8")
         tools = snapshot.get("tools", {})
-        tools_var.set("Gemini 3.8 工具：" + " / ".join(s.upper() + (" 已验证" if tools.get(s) is True else " 未验证" if tools.get(s) is False else " 状态未知") for s in ("ais", "build")))
+        tools_var.set("Gemini 3.8 工具目录声明：" + " / ".join(s.upper() + (" 支持" if tools.get(s) is True else " 未声明支持" if tools.get(s) is False else " 状态未知") for s in ("ais", "build")))
 
     def refreshed(value):
         refresh_rows(value)
@@ -192,27 +192,6 @@ def open_window(manager):
             preview.delete(*preview.get_children())
         begin(work, finished)
 
-    def verify_tools():
-        selected = [s for s in ("ais", "build") if channels[s].get()]
-        if not selected:
-            status_var.set("请勾选 AIS 或 Build。工具验证会额外发起函数调用及结果回传，不操作本机文件或命令。")
-            return
-        def work():
-            from verify_aistudio_tools import verify
-            report = verify(manager, selected, apply=True, progress=progress)
-            if report.get("enabled_sources"):
-                manager.wait_after_import(False, progress)
-            return report, manager.snapshot()
-        def finished(value):
-            report, snapshot = value
-            refresh_rows(snapshot)
-            enabled = report.get("enabled_sources", [])
-            if enabled:
-                status_var.set("工具回环已验证并启用：" + "、".join(s.upper() for s in enabled) + " · Gemini 3.8。其他型号保持原状态。")
-            else:
-                status_var.set("工具验证未通过，未开放能力。请先确认登录与普通测活；不支持的通道仍会返回 unsupported_tools。")
-        begin(work, finished)
-
     toolbar = ttk.Frame(frame)
     toolbar.pack(fill="x", pady=(0, 10))
     action_button(toolbar, "选择 JSON（可多选）", choose)
@@ -245,12 +224,11 @@ def open_window(manager):
     tools = ttk.Frame(frame); tools.pack(fill="x", pady=(0, 12))
     action_button(tools, "一键测活", test, True)
     action_button(tools, "刷新状态", lambda: begin(manager.snapshot, refreshed))
-    action_button(tools, "验证 AIS / Build 工具", verify_tools)
     bar = ttk.Progressbar(frame, mode="indeterminate"); bar.pack(fill="x", pady=(3, 10))
     ttk.Label(frame, textvariable=status_var, wraplength=970).pack(anchor="w")
     tools_var = tk.StringVar(value="正在读取工具状态…")
     ttk.Label(frame, textvariable=tools_var, style="Muted.TLabel").pack(anchor="w", pady=(8, 0))
-    ttk.Label(frame, text="测活检查轮询中的一个账号；工具验证每通道最多 4 条短请求，仅测试固定回显函数。\nunsupported_tools 是能力限制。过期后需在 Edge 重新导出。关闭窗口即退出。", style="Muted.TLabel").pack(anchor="w", pady=(5, 0))
+    ttk.Label(frame, text="参数、工具、图片和流式由上游处理，不需要人工验证记录。测活仅在你主动选择时运行。\n登录过期需在 Edge 重新导出。关闭窗口即退出。", style="Muted.TLabel").pack(anchor="w", pady=(5, 0))
 
     def drain():
         try:

@@ -54,12 +54,3 @@ services:
       AISTUDIO_HTTP_BASE_URL: http://aistudio-http:2048
       AISTUDIO_HTTP_API_KEY: ${AISTUDIO_HTTP_API_KEY:?Set a dedicated AISTUDIO_HTTP_API_KEY}
       AISTUDIO_HTTP_ALLOW_HTTP: "true"
-      AISTUDIO_HTTP_EVIDENCE_FILE: /run/aistudio-evidence.json
-      AISTUDIO_HTTP_EVIDENCE_MAX_AGE_SEC: ${AISTUDIO_HTTP_EVIDENCE_MAX_AGE_SEC:-604800}
-    volumes:
-      - type: bind
-        source: ${AISTUDIO_EVIDENCE_FILE:-./auth/aistudio-http/evidence.json}
-        target: /run/aistudio-evidence.json
-        read_only: true
-        bind:
-          create_host_path: false

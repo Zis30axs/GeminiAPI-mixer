@@ -13,7 +13,6 @@ import os
 import re
 import threading
 import time
-from datetime import datetime, timezone
 from urllib.parse import urlsplit
 
 import httpx
@@ -25,9 +24,6 @@ TRANSPORT = "aistudio-http"
 CHANNEL_HEADER = "X-Mixer-Upstream-Channel"
 CHANNELS = {"ais": "playground", "build": "build"}
 _MODEL = re.compile(r"[a-z][a-z0-9]*(?:[-.][a-z0-9]+)*\Z")
-_PARAMETERS = frozenset({"temperature", "topP", "topK", "maxOutputTokens", "stopSequences",
-                         "responseMimeType", "responseSchema", "responseJsonSchema",
-                         "presencePenalty", "frequencyPenalty", "seed"})
 _CACHE = {}
 _LOCK = threading.Lock()
 
@@ -193,86 +189,43 @@ def _catalog(source, base, key, allowlist):
     return result
 
 
-def _evidence(base):
-    """Read bounded, expiring local evidence; absent/invalid evidence grants nothing."""
-    path = os.environ.get("AISTUDIO_HTTP_EVIDENCE_FILE", "")
-    if not path:
-        return {}
-    try:
-        max_age = float(os.environ.get("AISTUDIO_HTTP_EVIDENCE_MAX_AGE_SEC", "604800"))
-        if not 1 <= max_age <= 2592000:
-            return {}
-        with open(path, "rb") as handle:
-            payload = handle.read(128 * 1024 + 1)
-        if len(payload) > 128 * 1024:
-            return {}
-        data = json.loads(payload)
-        if type(data.get("version")) is not int or data.get("version") != 1 or data.get("backend_base_url") != base:
-            return {}
-        observed = datetime.fromisoformat(data["verified_at"].replace("Z", "+00:00"))
-        if observed.tzinfo is None:
-            return {}
-        age = (datetime.now(timezone.utc) - observed).total_seconds()
-        models = data.get("models", {})
-        if not -300 <= age <= max_age or not isinstance(models, dict) or len(models) > 200:
-            return {}
-        return models
-    except (OSError, ValueError, TypeError, KeyError, AttributeError, RecursionError):
-        return {}
-
-
-def _thinking(entry, proof):
+def _thinking(entry):
+    """Exact native level names from the upstream catalog, no local evidence gate."""
     caps = entry.get("capabilities", {})
     options = entry.get("capability_options", {})
     levels = options.get("thinking_levels", []) if isinstance(options, dict) else []
     levels = ({v.lower() for v in levels} if isinstance(levels, list)
               and all(isinstance(v, str) and v.lower() in ("minimal", "low", "medium", "high") for v in levels)
               else set())
-    result = {}
-    raw = proof.get("thinking", {})
-    if not isinstance(raw, dict):
-        return result
-    for effort in ("low", "medium", "high"):
-        config = raw.get(effort)
-        if not isinstance(config, dict):
-            continue
-        if set(config) == {"thinkingLevel"}:
-            value = config["thinkingLevel"]
-            if (caps.get("thinking_level") is True and isinstance(value, str)
-                    and value.lower() == effort and effort in levels):
-                result[effort] = {"thinkingLevel": value.upper()}
-        elif set(config) == {"thinkingBudget"}:
-            value = config["thinkingBudget"]
-            if caps.get("thinking_budget") is True and type(value) is int and 0 <= value <= 1048576:
-                result[effort] = {"thinkingBudget": value}
-    return result
+    return {effort: {"thinkingLevel": effort.upper()} for effort in ("low", "medium", "high")
+            if caps.get("thinking_level") is True and effort in levels}
 
 
 class SidecarRoute:
-    def __init__(self, source, model, effort, alias, base, key, entry, proof):
+    def __init__(self, source, model, effort, alias, base, key, entry):
         self.source, self.model, self.effort, self.alias = source, model, effort, alias
         self.base, self._key, self.channel = base, key, CHANNELS[source]
         self._bounds, self._entry = _limits(), entry
-        self._proof = proof if isinstance(proof, dict) and proof.get("text") is True else {}
-        self._thinking = _thinking(entry, self._proof)
+        self._thinking = _thinking(entry)
         self._native_thinking = {}
         if effort is not None and effort not in self._thinking:
-            raise _error(400, "unsupported_reasoning_effort", "This AI Studio channel has no verified mapping for the requested thinking effort.")
+            raise _error(400, "unsupported_reasoning_effort", "The upstream catalog does not declare this native thinking level.")
 
     @property
     def capabilities(self):
         caps = self._entry["capabilities"]
-        return {"text": True, "streaming": self._proof.get("streaming") is True,
-                "image_input": self._proof.get("image_input") is True and caps.get("image_input") is True,
+        return {"text": True, "streaming": True,
+                "image_input": caps.get("image_input") is True,
                 "image_output": False,
-                "tools": self._proof.get("tools") is True and caps.get("function_declarations") is True,
+                "tools": caps.get("function_declarations") is True,
                 "thinking_efforts": list(self._thinking)}
 
     @property
     def meta(self):
         result = dict(initial_metadata(self.source), upstream_model=self.model, requested_effort=self.effort,
                       model_identity="exact-upstream-catalogue-id",
-                      verification="generation-verified" if self._proof.get("text") is True else "upstream-declared")
+                      verification="upstream-declared", capability_policy="upstream-controlled",
+                      manual_verification_required=False)
         thinking = self._thinking.get(self.effort, self._native_thinking)
         if "thinkingLevel" in thinking:
             result["effective_thinking_level"] = thinking["thinkingLevel"].lower()
@@ -298,15 +251,6 @@ class SidecarRoute:
             raise _error(400, "unsupported_parameter", "Cached content and safety-setting overrides are not enabled for this channel.")
         if "systemInstruction" in body and any(set(part) != {"text"} for part in body["systemInstruction"]["parts"]):
             raise _error(400, "unsupported_parameter", "System instructions must contain plain text only.")
-        caps = self.capabilities
-        for content in body["contents"] + ([body["systemInstruction"]] if "systemInstruction" in body else []):
-            for part in content["parts"]:
-                if "inlineData" in part and not caps["image_input"]:
-                    raise _error(400, "unsupported_image_input", "Image input has not been verified for this AI Studio channel/model.")
-                if any(k in part for k in ("functionCall", "functionResponse")) and not caps["tools"]:
-                    raise _error(400, "unsupported_tools", "Function calling has not been verified for this AI Studio channel/model.")
-        if (body.get("tools") or "toolConfig" in body) and not caps["tools"]:
-            raise _error(400, "unsupported_tools", "Function calling has not been verified for this AI Studio channel/model.")
         if "toolConfig" in body:
             tool_config = body["toolConfig"]
             function_config = tool_config.get("functionCallingConfig") if isinstance(tool_config, dict) else None
@@ -321,10 +265,6 @@ class SidecarRoute:
             if not isinstance(names, list) or any(not isinstance(name, str) or name not in declared for name in names):
                 raise _error(400, "unsupported_tools", "Allowed function names must refer to declared tools.")
         gen = body.setdefault("generationConfig", {})
-        parameters = self._proof.get("parameters", [])
-        allowed = set(parameters) & _PARAMETERS if isinstance(parameters, list) and all(isinstance(v, str) for v in parameters) else set()
-        if set(gen) - allowed - {"thinkingConfig", "candidateCount", "responseModalities"}:
-            raise _error(400, "unsupported_parameter", "A generation parameter has not been verified for this AI Studio channel/model.")
         for field in ("temperature", "topP", "presencePenalty", "frequencyPenalty"):
             if field in gen and (isinstance(gen[field], bool) or not isinstance(gen[field], (int, float))):
                 raise _error(400, "invalid_request", "Generation sampling parameters must be numeric.")
@@ -341,10 +281,16 @@ class SidecarRoute:
             raise _error(400, "thinking_conflict", "Do not combine a thinking effort with a native thinking configuration.")
         if requested:
             normalized = dict(requested)
+            if set(normalized) - {"thinkingLevel", "thinkingBudget", "includeThoughts"}:
+                raise _error(400, "invalid_thinking_config", "Unknown native thinking configuration field.")
             if isinstance(normalized.get("thinkingLevel"), str):
                 normalized["thinkingLevel"] = normalized["thinkingLevel"].upper()
-            if normalized not in self._thinking.values():
-                raise _error(400, "unsupported_reasoning_effort", "This native thinking configuration has not been verified for this AI Studio channel/model.")
+            if "thinkingLevel" in normalized and normalized["thinkingLevel"] not in ("MINIMAL", "LOW", "MEDIUM", "HIGH"):
+                raise _error(400, "invalid_thinking_config", "Invalid native thinking level.")
+            if "thinkingBudget" in normalized and (type(normalized["thinkingBudget"]) is not int or not -1 <= normalized["thinkingBudget"] <= 1048576):
+                raise _error(400, "invalid_thinking_config", "Invalid native thinking budget.")
+            if "includeThoughts" in normalized and type(normalized["includeThoughts"]) is not bool:
+                raise _error(400, "invalid_thinking_config", "includeThoughts must be a boolean.")
             gen["thinkingConfig"] = normalized
             self._native_thinking = normalized
         elif self.effort is not None:
@@ -358,8 +304,6 @@ class SidecarRoute:
             parts, _finish = _candidate(value, allow_empty=not terminal)
         except (ProviderError, TypeError, ValueError, AttributeError):
             raise _error(502, "upstream_invalid_response", "The AI Studio backend returned an unsupported response.") from None
-        if not self.capabilities["tools"] and any("functionCall" in part for part in parts):
-            raise _error(502, "unsupported_tools", "The AI Studio backend returned an unverified function call.")
         if terminal and not _terminal_chunk(value):
             raise _error(502, "upstream_stream_incomplete", "The AI Studio backend returned no completion status.")
         return value
@@ -385,8 +329,6 @@ class SidecarRoute:
                     raise _safe_exception(error, deadline) from None
 
     def stream(self, native_body):
-        if not self.capabilities["streaming"]:
-            raise _error(400, "unsupported_streaming", "Streaming has not been verified for this AI Studio channel/model.")
         body = self.prepare(native_body)
         data = self._encoded(body)
         with _new_client(_timeout(self._bounds)) as client:
@@ -419,8 +361,7 @@ class SidecarRoute:
         level = body.get("generationConfig", {}).get("thinkingConfig", {}).get("thinkingLevel")
         if level is not None and (response.headers.get("X-Mixer-Thinking-Level") != level
                                   or response.headers.get("X-Mixer-Thinking-Validation") != "account-catalog"):
-            # A previously verified mapping must not conceal a downgraded backend
-            # or an account whose current catalogue silently clamps the level.
+            # Confirm the selected account did not silently clamp the level.
             raise _error(502, "upstream_thinking_not_verified",
                          "The AI Studio backend did not verify the requested thinking level against the selected account catalogue.")
 
@@ -443,8 +384,7 @@ def resolve_route(source, alias, effort=None):
     entry = _catalog(source, base, key, allowed).get(model)
     if not entry:
         raise _error(404, "upstream_model_not_found", "The requested model is not available on this AI Studio channel.")
-    proof = _evidence(base).get(source + "/" + model, {})
-    return SidecarRoute(source, model, suffix or effort, alias, base, key, entry, proof)
+    return SidecarRoute(source, model, suffix or effort, alias, base, key, entry)
 
 
 def list_models(source):
@@ -452,15 +392,13 @@ def list_models(source):
         base, key = _config()
         allowed = _allowlist(source)
         entries = _catalog(source, base, key, allowed) if allowed else {}
-        evidence = _evidence(base)
         result = []
         for model, entry in entries.items():
             base_alias = source + "-" + model
-            proof = evidence.get(source + "/" + model, {})
-            route = SidecarRoute(source, model, None, base_alias, base, key, entry, proof)
+            route = SidecarRoute(source, model, None, base_alias, base, key, entry)
             for effort in [None] + list(route._thinking):
                 alias = base_alias + ("-" + effort if effort else "")
-                variant = SidecarRoute(source, model, effort, alias, base, key, entry, proof)
+                variant = SidecarRoute(source, model, effort, alias, base, key, entry)
                 result.append({"id": alias, "object": "model", "created": 0, "owned_by": "google",
                                "source": source, "transport": TRANSPORT, "upstream_model": model,
                                "capabilities": variant.capabilities, "metadata": variant.meta, "discovered": True})

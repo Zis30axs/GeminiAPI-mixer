@@ -121,20 +121,23 @@ class AdapterFixture(unittest.TestCase):
 
 
 class AdapterTests(AdapterFixture):
-    def test_missing_evidence_is_base_text_without_public_thinking_claims(self):
+    def test_missing_evidence_does_not_gate_streaming_or_declared_tools(self):
         rows = providers.list_models()
         self.assertEqual(len(rows), 2)
         self.assertTrue(all(row["transport"] == "aistudio-http" for row in rows))
         self.assertTrue(all(row["capabilities"]["thinking_efforts"] == [] for row in rows))
-        self.assertTrue(all(row["capabilities"]["streaming"] is False for row in rows))
+        self.assertTrue(all(row["capabilities"]["streaming"] is True for row in rows))
+        self.assertTrue(all(row["capabilities"]["tools"] is True for row in rows))
         route = self.route()
         self.assertEqual(route.meta["verification"], "upstream-declared")
         self.assertEqual(route.generate(BODY), FINAL)
-        self.error("unsupported_streaming", lambda: list(route.stream(BODY)), 400)
+        self.result = lambda request: self.response(request, headers={"Content-Type":"text/event-stream"}, content=event(FINAL))
+        self.assertEqual(list(route.stream(BODY)), [FINAL])
         self.error("unsupported_reasoning_effort", lambda: self.route(effort="low"), 400)
 
     def test_verified_native_mapping_and_explicit_source_credentials(self):
-        self.proof()
+        self.entries[0]["capabilities"]["thinking_level"] = True
+        self.entries[0]["capability_options"] = {"thinking_levels":["low"]}
         route = self.route("build-" + MODEL + "-low")
         self.assertEqual(route.generate(BODY), FINAL)
         request = self.requests[-1]
@@ -143,19 +146,21 @@ class AdapterTests(AdapterFixture):
         self.assertNotIn("x-goog-api-key", request.headers)
         self.assertNotIn("cookie", request.headers)
         self.assertEqual(request.url.path, "/v1beta/models/" + MODEL + ":generateContent")
-        self.assertEqual(json.loads(request.content)["generationConfig"]["thinkingConfig"], {"thinkingBudget": 777})
-        self.assertEqual(route.meta["effective_thinking_budget"], 777)
+        self.assertEqual(json.loads(request.content)["generationConfig"]["thinkingConfig"], {"thinkingLevel": "LOW"})
+        self.assertEqual(route.meta["effective_thinking_level"], "low")
         self.assertNotIn("synthetic", repr(route))
 
     def test_native_thinking_must_match_evidence_and_conflicts_fail(self):
-        self.proof()
+        self.entries[0]["capabilities"]["thinking_level"] = True
+        self.entries[0]["capability_options"] = {"thinking_levels":["low","high"]}
         route = self.route()
         native = dict(BODY, generationConfig={"thinkingConfig": {"thinkingBudget": 777}})
         route.prepare(native)
         self.assertEqual(route.meta["effective_thinking_budget"], 777)
         self.error("thinking_conflict", lambda: self.route("ais-" + MODEL + "-low", "high"))
         self.error("thinking_conflict", lambda: self.route(effort="low").prepare(native))
-        self.error("unsupported_reasoning_effort", lambda: route.prepare(dict(BODY, generationConfig={"thinkingConfig": {"thinkingBudget": 1024}})))
+        self.assertEqual(route.prepare(dict(BODY, generationConfig={"thinkingConfig": {"thinkingBudget": 1024}}))["generationConfig"]["thinkingConfig"], {"thinkingBudget":1024})
+        self.error("invalid_thinking_config", lambda: route.prepare(dict(BODY, generationConfig={"thinkingConfig": {"thinkingBudget": True}})))
 
     def test_catalogue_and_evidence_are_both_required(self):
         self.proof()
@@ -170,18 +175,27 @@ class AdapterTests(AdapterFixture):
         for changes in ({"verified_at": "2000-01-01T00:00:00Z"}, {"backend_base_url": "https://other.example"},
                         {"models": []}, {"version": True}):
             self.proof(**changes)
-            self.assertFalse(self.route().capabilities["streaming"])
+            self.assertTrue(self.route().capabilities["streaming"])
+            self.assertTrue(self.route().capabilities["tools"])
             self.error("unsupported_reasoning_effort", lambda: self.route(effort="low"))
 
     def test_unverified_inputs_reject_before_generation(self):
         route = self.route()
-        for body, code in ((dict(BODY, tools=[{"functionDeclarations": []}]), "unsupported_tools"),
-                           (dict(BODY, generationConfig={"temperature": 1}), "unsupported_parameter"),
-                           (dict(BODY, cachedContent="other"), "unsupported_parameter"),
-                           (dict(BODY, safetySettings=[]), "unsupported_parameter"),
-                           ({"contents": [{"parts": [{"inlineData": {"mimeType": "image/png", "data": "eA=="}}]}]}, "unsupported_image_input")):
+        for body, code in ((dict(BODY, cachedContent="other"), "unsupported_parameter"),
+                           (dict(BODY, safetySettings=[]), "unsupported_parameter")):
             self.error(code, lambda body=body: route.generate(body))
         self.assertTrue(all(r.method == "GET" for r in self.requests))
+
+    def test_parameters_tools_and_inline_images_pass_without_manual_evidence(self):
+        route = self.route()
+        bodies = [dict(BODY, generationConfig={"temperature":1,"topP":.9,"maxOutputTokens":4096}),
+                  dict(BODY,tools=[{"functionDeclarations":[{"name":"echo"}]}]),
+                  {"contents":[{"parts":[{"inlineData":{"mimeType":"image/png","data":"eA=="}}]}]}]
+        for body in bodies:
+            self.assertEqual(route.generate(body), FINAL)
+            wire = json.loads(self.requests[-1].content)
+            for field, value in body.items():
+                self.assertEqual(wire[field], value)
 
     def test_missing_or_wrong_channel_lock_never_accepts_success(self):
         for headers in ({adapter.CHANNEL_HEADER: "build", "X-Mixer-Channel-Locked": "1"},
@@ -262,7 +276,7 @@ class AdapterTests(AdapterFixture):
         bad["toolConfig"]["functionCallingConfig"]["allowedFunctionNames"] = ["not_declared"]
         self.error("unsupported_tools", lambda: route.generate(bad))
         self.proof({"tools": False})
-        self.error("unsupported_tools", lambda: self.route().generate(BODY), 502)
+        self.assertEqual(self.route().generate(BODY), tool_result)
 
     def test_native_level_proof_is_channel_specific_and_confirms_catalogue_options(self):
         self.entries[0]["capabilities"]["thinking_level"] = True
@@ -274,7 +288,7 @@ class AdapterTests(AdapterFixture):
         data = json.loads(Path(os.environ["AISTUDIO_HTTP_EVIDENCE_FILE"]).read_text())
         del data["models"]["build/" + MODEL]
         Path(os.environ["AISTUDIO_HTTP_EVIDENCE_FILE"]).write_text(json.dumps(data))
-        self.error("unsupported_reasoning_effort", lambda: self.route("build-" + MODEL, "low"))
+        self.assertEqual(self.route("build-" + MODEL, "low").prepare(BODY)["generationConfig"]["thinkingConfig"], {"thinkingLevel":"LOW"})
 
 
 class MixerAdapterHTTPTests(AdapterFixture):
@@ -322,7 +336,7 @@ class MixerAdapterHTTPTests(AdapterFixture):
     def test_three_stream_formats_and_catalogue_capability_methods(self):
         status, _, raw = self.call("/v1beta/models")
         self.assertEqual(status, 200)
-        self.assertTrue(all(m["supportedGenerationMethods"] == ["generateContent"] for m in json.loads(raw)["models"]))
+        self.assertTrue(all(m["supportedGenerationMethods"] == ["generateContent", "streamGenerateContent"] for m in json.loads(raw)["models"]))
         self.proof()
         self.result = lambda request: self.response(request, headers={"Content-Type": "text/event-stream"}, content=event(FINAL))
         for path, body, terminal in (("/v1/chat/completions", {"model": "ais-" + MODEL, "messages": [{"role": "user", "content": "hi"}], "stream": True}, "[DONE]"),
@@ -356,7 +370,7 @@ class MixerAdapterHTTPTests(AdapterFixture):
         self.assertEqual(status, 200, raw)
         models = {entry["id"]: entry for entry in json.loads(raw)["data"]}
         expected = {"ais-" + ARGON_MODEL, "build-" + ARGON_MODEL}
-        expected.update("ais-" + ARGON_MODEL + "-" + level for level in ("low", "medium", "high"))
+        expected.update(source + "-" + ARGON_MODEL + "-" + level for source in ("ais", "build") for level in ("low", "medium", "high"))
         self.assertEqual(set(models), expected)
         for level in ("low", "medium", "high"):
             row = models["ais-" + ARGON_MODEL + "-" + level]
@@ -368,7 +382,7 @@ class MixerAdapterHTTPTests(AdapterFixture):
             self.assertEqual(row["metadata"]["requested_effort"], level)
             self.assertEqual(row["metadata"]["effective_thinking_level"], level)
             self.assertNotIn("effective_thinking_budget", row["metadata"])
-        self.assertEqual(models["build-" + ARGON_MODEL]["capabilities"]["thinking_efforts"], [])
+        self.assertEqual(models["build-" + ARGON_MODEL]["capabilities"]["thinking_efforts"], ["low","medium","high"])
         self.assertNotIn("effective_thinking_level", models["ais-" + ARGON_MODEL]["metadata"])
         self.assertTrue(all(request.method == "GET" for request in self.requests))
 
@@ -435,17 +449,16 @@ class MixerAdapterHTTPTests(AdapterFixture):
 
     def test_argon_missing_level_or_conflicting_controls_fail_before_generation(self):
         self.argon_level_proof(("low", "high"))
+        self.entries[0]["capability_options"] = {"thinking_levels":["low","high"]}
         os.environ["BUILD_MODELS"] = ARGON_MODEL
         alias = "ais-" + ARGON_MODEL
         calls = [
             ("/v1/chat/completions", {"model": alias + "-medium", "messages": [{"role": "user", "content": "hi"}]}, "unsupported_reasoning_effort"),
             ("/v1/chat/completions", {"model": alias, "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "medium"}, "unsupported_reasoning_effort"),
             ("/v1/responses", {"model": alias, "input": "hi", "reasoning": {"effort": "medium"}}, "unsupported_reasoning_effort"),
-            ("/v1beta/models/" + alias + ":generateContent", dict(BODY, generationConfig={"thinkingConfig": {"thinkingLevel": "MEDIUM"}}), "unsupported_reasoning_effort"),
             ("/v1/chat/completions", {"model": alias + "-low", "messages": [{"role": "user", "content": "hi"}], "reasoning_effort": "high"}, "thinking_conflict"),
             ("/v1/responses", {"model": alias + "-low", "input": "hi", "reasoning": {"effort": "high"}}, "thinking_conflict"),
             ("/v1beta/models/" + alias + "-low:generateContent", dict(BODY, generationConfig={"thinkingConfig": {"thinkingLevel": "LOW"}}), "thinking_conflict"),
-            ("/v1/responses", {"model": "build-" + ARGON_MODEL, "input": "hi", "reasoning": {"effort": "low"}}, "unsupported_reasoning_effort"),
         ]
         for path, body, code in calls:
             with self.subTest(path=path, body=body):
@@ -471,11 +484,8 @@ class MixerAdapterHTTPTests(AdapterFixture):
         Path(os.environ["AISTUDIO_HTTP_EVIDENCE_FILE"]).write_text(json.dumps(data))
         status, _, raw = self.call("/v1/chat/completions", {
             "model": "ais-" + ARGON_MODEL + "-low", "messages": [{"role": "user", "content": "hi"}]})
-        self.assertEqual(status, 400, raw)
-        self.assertEqual(json.loads(raw)["error"]["code"], "unsupported_reasoning_effort")
-        rows = json.loads(self.call("/v1/models")[2])["data"]
-        self.assertFalse(any(row["id"].endswith("-low") for row in rows))
-        self.assertTrue(all(request.method == "GET" for request in self.requests))
+        self.assertEqual(status, 200, raw)
+        self.assertEqual(json.loads(self.requests[-1].content)["generationConfig"]["thinkingConfig"], {"thinkingLevel":"LOW"})
 
     def test_argon_unknown_or_empty_catalogue_levels_never_grant_thinking(self):
         for options in (None, {}, {"thinking_levels": []}):
@@ -495,9 +505,7 @@ class MixerAdapterHTTPTests(AdapterFixture):
                     self.assertEqual(json.loads(raw)["error"]["code"], "unsupported_reasoning_effort")
                 status, _, raw = self.call("/v1beta/models/ais-" + ARGON_MODEL + ":generateContent",
                                            dict(BODY, generationConfig={"thinkingConfig": {"thinkingLevel": "LOW"}}))
-                self.assertEqual(status, 400, raw)
-                self.assertEqual(json.loads(raw)["error"]["code"], "unsupported_reasoning_effort")
-        self.assertTrue(all(request.method == "GET" for request in self.requests))
+                self.assertEqual(status, 200, raw)
 
     def test_argon_missing_or_wrong_account_thinking_acknowledgement_rejects_success(self):
         self.argon_level_proof()

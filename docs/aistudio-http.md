@@ -142,47 +142,21 @@ docker compose -f compose.yml -f compose.aistudio.yml up -d --build
 `AISTUDIO_GO_MEMORY_LIMIT=256MiB` 是 Go GC 的软目标，容器 `AISTUDIO_MEMORY_LIMIT=512m` 才是硬限制。
 内存超限会使请求失败；没有测量前不能承诺固定 MB 或相对 WebView2 的节约比例。
 
-## 能力证据与验证
+## 上游能力与请求转发
 
-`/v1/models` 是后端声明与本地允许列表的交集，不证明生成额度。
-流式、思考档位、图像和工具还需要当前有效的实测记录。
-记录分别使用 `ais/<model>`、`build/<model>`，不得跨通道套用。
+AIS/Build 不再要求本地人工验证记录。参数、工具调用、图片和流式请求在完成协议转换与
+格式检查后交给自托管后端，由实际账号和上游返回支持或错误结果。证据文件缺失、过期
+或包含 tools=false / 空 parameters 均不会再拦截请求。
 
-显式 `thinkingLevel` 还要求目录的 `capability_options.thinking_levels` 明确列出该档位，
-只声明 `thinking_level=true` 不够。Go 后端在选定实际账号后再次检查其目录，
-拒绝将档位静默替换为相近值，或丢弃档位使用默认值。
-Mixer 对每次响应核对 `X-Mixer-Thinking-Level` 和
-`X-Mixer-Thinking-Validation: account-catalog`；缺失或不一致返回 502。
-这表示精确参数已通过所选账号目录校验并被发送，不是 Google 返回的内部计算量证明。
-公开 API 档位映射不自动套用到此网页会话通道。
+`/v1/models` 仍是后端目录与本地允许列表的交集；能力字段表示后端声明，元信息标记
+`capability_policy=upstream-controlled`、`manual_verification_required=false`。
+低中高思考别名只使用目录明确列出的原生 thinkingLevel，不编造预算映射。
+原生 thinkingConfig 的有效数值直接转交后端。所选账号的档位确认与来源锁定仍保留，
+避免上游静默降档或切换通道。
 
-```json
-{
-  "version": 1,
-  "backend_base_url": "http://aistudio-http:2048",
-  "verified_at": "2026-10-17T00:00:00Z",
-  "models": {
-    "ais/example-model": {
-      "text": true,
-      "streaming": true,
-      "image_input": false,
-      "tools": false,
-      "parameters": ["maxOutputTokens"],
-      "thinking": {"low": {"thinkingLevel": "LOW"}}
-    }
-  }
-}
-```
+保留认证、账号权限、实际额度、JSON/媒体格式、传输大小、超时、取消、TLS及固定后端
+地址检查。对于适配器没有实现转换的协议字段仍明确报错。
+旧 `AISTUDIO_EVIDENCE_FILE` 和过期时间配置无需再设置，Compose 不再挂载该文件。
+历史记录可以保留供查阅，不作为运行许可。
 
-以上为格式示例，不能复制为真实通过记录。后端也必须声明相应能力。
-证据默认 7 天过期；缺失或过期时只保留声明的基础文本，其他能力明确报错。
-真实验证应依次完成各通道非流式、真正增量流式、取消/超时和来源核对，
-再通过 Mixer 的 Chat、Responses、Gemini 原生入口验证。思考等级必须核对实际映射。
-返回未知 token usage 时保持未知，不自行估算为真实用量。
-
-目前后端模型目录缺少明确的图像输入声明，适配器会拒绝图像请求；不因原生协议可携带图片就宣布端到端支持。
-后端的用量账本与冷却列表不等于 Google 各模型剩余额度。
-
-自动化测试使用合成后端与本地 fixture，不能替代真实账号生成验证。
-手动生成、SSE 验收和能力证据的生成步骤见 [通道验收](aistudio-http-verification.md)。
-实际部署验证记录应分别列出账号准备、后端启动、AIS、Build、流式、内存各项结果，保留失败和未完成项。
+本次切换不发起上游测试生成。快捷入口默认不自动测活，用户需要时仍可主动点“一键测活”。
